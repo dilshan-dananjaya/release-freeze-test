@@ -1,6 +1,6 @@
 {
   "source_branch": "dev",
-  "create_branch": ["dilshan-dananjaya"],
+  "create_branch": ["someone-else"],
   "signoff": {
     "QA approved (product)": ["dilshan-dananjaya"],
     "QA approved (client)": ["dilshan-dananjaya"],
