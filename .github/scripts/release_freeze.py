@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Freeze a release branch after sign-off. See jahanVerse#18469."""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://api.github.com"
+REPO = os.environ["GITHUB_REPOSITORY"]
+TOKEN = os.environ["GITHUB_TOKEN"]
+SIGNOFF_LABEL = "release-sign-off"
+OVERRIDE_LABEL = "freeze-override"
+CHECK_WORKFLOW = "Release freeze check"
+
+with open(".github/release_signoff.json", encoding="utf-8") as f:
+    APPROVERS = json.load(f)
+
+
+def api(method, path, data=None):
+    """Call the GitHub API. Returns None for a 404."""
+    request = urllib.request.Request(
+        f"{API}/repos/{REPO}/{path}",
+        method=method,
+        data=json.dumps(data).encode() if data is not None else None,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            body = response.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        print(f"{method} {path} failed: {error.code} {error.read().decode()}")
+        raise
+
+
+def tag_sha(tag):
+    ref = api("GET", f"git/ref/tags/{urllib.parse.quote(tag)}")
+    if not ref:
+        return None
+    if ref["object"]["type"] == "tag":
+        return api("GET", f"git/tags/{ref['object']['sha']}")["object"]["sha"]
+    return ref["object"]["sha"]
+
+
+def branch_sha(branch):
+    found = api("GET", f"branches/{urllib.parse.quote(branch, safe='')}")
+    return found["commit"]["sha"] if found else None
+
+
+def latest_rc(version):
+    refs = api("GET", f"git/matching-refs/tags/{version}-rc") or []
+    numbers = []
+    for ref in refs:
+        match = re.fullmatch(rf"refs/tags/{re.escape(version)}-rc(\d+)", ref["ref"])
+        if match:
+            numbers.append(int(match.group(1)))
+    return f"{version}-rc{max(numbers)}" if numbers else None
+
+
+def read_version(body):
+    match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t]*$", body, re.M)
+    return match.group(1) if match else None
+
+
+def read_rc(body):
+    match = re.search(r"^Release candidate:[ \t]*`([^`]+)`[ \t]*$", body, re.M)
+    return match.group(1) if match else None
+
+
+def boxes(body):
+    """Returns {box text: ticked} for the sign-off boxes."""
+    found = {}
+    for box in APPROVERS:
+        match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t]*$", body, re.M)
+        if match:
+            found[box] = match.group(1) != " "
+    return found
+
+
+def set_box(body, box, ticked):
+    mark = "x" if ticked else " "
+    return re.sub(
+        rf"^- \[[ xX]\] {re.escape(box)}([ \t]*)$",
+        lambda match: f"- [{mark}] {box}{match.group(1)}",
+        body,
+        flags=re.M,
+    )
+
+
+def clear_boxes(body):
+    for box in APPROVERS:
+        body = set_box(body, box, False)
+    return body
+
+
+def set_line(body, name, value):
+    return re.sub(rf"^{name}:.*$", f"{name}: {value}", body, flags=re.M)
+
+
+def fill_ticket(body):
+    """Adds the branch and latest RC. Clears the ticks if the RC changed."""
+    version = read_version(body)
+    if not version:
+        return body, False
+    rc = latest_rc(version)
+    old_rc = read_rc(body)
+    body = set_line(body, "Release branch", f"`release/{version}`")
+    body = set_line(body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC")
+    rc_changed = old_rc != rc and any(boxes(body).values())
+    if rc_changed:
+        body = clear_boxes(body)
+    return body, rc_changed
+
+
+def comment(number, text):
+    api("POST", f"issues/{number}/comments", {"body": text})
+
+
+def rerun_checks(branch):
+    """Open PRs that passed before the freeze must be checked again."""
+    query = urllib.parse.urlencode({"state": "open", "base": branch, "per_page": 100})
+    for pull in api("GET", f"pulls?{query}"):
+        sha = pull["head"]["sha"]
+        runs = api("GET", f"actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]
+        runs = [run for run in runs if run["name"] == CHECK_WORKFLOW]
+        if runs:
+            api("POST", f"actions/runs/{runs[0]['id']}/rerun", {})
+
+
+def freeze(number, version, rc):
+    branch = f"release/{version}"
+    head = branch_sha(branch)
+    rc_commit = tag_sha(rc) if rc else None
+    if not head or not rc_commit:
+        comment(number, f"Not frozen: `{branch}` or its RC doesn't exist yet.")
+        return
+    if head != rc_commit:
+        comment(
+            number,
+            f"Not frozen: `{branch}` has moved past `{rc}`. "
+            "Create a new RC, test it and sign off again.",
+        )
+        return
+    frozen = f"frozen/{version}"
+    if tag_sha(frozen):
+        api("PATCH", f"git/refs/tags/{frozen}", {"sha": head, "force": True})
+    else:
+        api("POST", "git/refs", {"ref": f"refs/tags/{frozen}", "sha": head})
+    rerun_checks(branch)
+    comment(number, f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
+
+
+def signoff(event):
+    issue = event["issue"]
+    number = issue["number"]
+    sender = event["sender"]["login"]
+    live = api("GET", f"issues/{number}")["body"] or ""
+
+    changed = []
+    if event["action"] == "edited":
+        if "body" not in event.get("changes", {}):
+            return
+        before = boxes(event["changes"]["body"]["from"] or "")
+        after = boxes(issue["body"] or "")
+        changed = [box for box in after if before.get(box) != after[box]]
+
+    body = live
+    for box in changed:
+        if sender not in APPROVERS[box]:
+            body = set_box(body, box, before.get(box, False))
+            comment(number, f"`{box}` was changed back: @{sender} can't sign off this box.")
+    allowed = [box for box in changed if sender in APPROVERS[box]]
+
+    body, rc_changed = fill_ticket(body)
+    if body != live:
+        api("PATCH", f"issues/{number}", {"body": body})
+    if rc_changed:
+        comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")
+        return
+
+    ticks = boxes(body)
+    if allowed and len(ticks) == len(APPROVERS) and all(ticks.values()):
+        freeze(number, read_version(body), read_rc(body))
+
+
+def new_rc(event):
+    release = event["release"]
+    match = re.fullmatch(r"(v\d+\.\d+\.\d+)-rc\d+", release["tag_name"])
+    if not release["prerelease"] or not match:
+        return
+    query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
+    for issue in api("GET", f"issues?{query}"):
+        body = issue["body"] or ""
+        if read_version(body) != match.group(1):
+            continue
+        new_body, rc_changed = fill_ticket(body)
+        if new_body != body:
+            api("PATCH", f"issues/{issue['number']}", {"body": new_body})
+        if rc_changed:
+            comment(
+                issue["number"],
+                f"The RC is now `{read_rc(new_body)}`, so the sign-off ticks were cleared.",
+            )
+
+
+def fail(message):
+    print(f"::error::{message}")
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+        summary.write(f"{message}\n")
+    sys.exit(1)
+
+
+def check(event):
+    number = event["pull_request"]["number"]
+    pull = api("GET", f"pulls/{number}")
+    name = pull["base"]["ref"].removeprefix("release/")
+    reason = None
+    if tag_sha(name):
+        reason = f"`{name}` is already released"
+    elif tag_sha(f"frozen/{name}"):
+        reason = f"`release/{name}` is frozen"
+    if not reason:
+        print(f"release/{name} is not frozen.")
+        return
+
+    labels = [label["name"] for label in pull["labels"]]
+    if OVERRIDE_LABEL not in labels:
+        fail(f"{reason}. A late fix needs the `{OVERRIDE_LABEL}` label from a second person.")
+
+    events = api("GET", f"issues/{number}/events?per_page=100")
+    added = [
+        item["actor"]["login"]
+        for item in events
+        if item["event"] == "labeled" and item["label"]["name"] == OVERRIDE_LABEL
+    ]
+    labeller = added[-1]
+    reviews = api("GET", f"pulls/{number}/reviews?per_page=100")
+    approvers = {r["user"]["login"] for r in reviews if r["state"] == "APPROVED"}
+    if labeller == pull["user"]["login"] or labeller in approvers:
+        fail(f"{reason}. `{OVERRIDE_LABEL}` must come from someone who didn't write or approve this PR.")
+    print(f"{reason}, but {labeller} added {OVERRIDE_LABEL}.")
+
+
+def gate(version):
+    frozen = tag_sha(f"frozen/{version}")
+    head = branch_sha(f"release/{version}")
+    if not frozen:
+        fail(f"`{version}` has no sign-off: `frozen/{version}` doesn't exist.")
+    if frozen != head:
+        fail(f"`release/{version}` has commits that aren't in the approved RC.")
+    print(f"{version} matches the approved RC at {frozen}.")
+
+
+def main():
+    command = sys.argv[1]
+    if command == "gate":
+        gate(sys.argv[2])
+        return
+    with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
+        event = json.load(f)
+    {"signoff": signoff, "new-rc": new_rc, "check": check}[command](event)
+
+
+if __name__ == "__main__":
+    main()

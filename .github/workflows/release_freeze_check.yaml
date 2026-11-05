@@ -1,0 +1,26 @@
+name: Release freeze check
+
+on:
+  pull_request_target:
+    branches: ['release/v*']
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  freeze-check:
+    if: startsWith(github.event.pull_request.base.ref, 'release/v')
+    runs-on: ubuntu-latest
+    steps:
+      # Runs the script from the default branch, never from the PR.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - run: python3 .github/scripts/release_freeze.py check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

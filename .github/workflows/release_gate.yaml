@@ -1,0 +1,21 @@
+name: Release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example v0.20.9
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/scripts/release_freeze.py gate "$VERSION"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
