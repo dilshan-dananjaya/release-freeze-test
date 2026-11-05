@@ -14,11 +14,13 @@ TOKEN = os.environ["GITHUB_TOKEN"]
 SIGNOFF_LABEL = "release-sign-off"
 OVERRIDE_LABEL = "freeze-override"
 CHECK_WORKFLOW = "Release freeze check"
+SOURCE_BRANCH = "dev"
 BRANCH_BOX = "Create release branch"
-
-with open(".github/release_signoff.json", encoding="utf-8") as f:
-    CONFIG = json.load(f)
-APPROVERS = CONFIG["signoff"]
+OWNER_BOX = "Release owner approved"
+QA_BOXES = ["QA approved (product)", "QA approved (client)"]
+SIGNOFF_BOXES = QA_BOXES + [OWNER_BOX]
+OWNER_LINE = "Release Owner"
+QA_LINE = "QA Approver"
 
 
 def api(method, path, data=None):
@@ -78,6 +80,37 @@ def read_rc(body):
     return match.group(1) if match else None
 
 
+def people(body, line):
+    """Returns the lower-case GitHub names on a ticket line, like `QA Approver: @a @b`."""
+    match = re.search(rf"^{line}:(.*)$", body, re.M)
+    return [name.lower() for name in re.findall(r"@([A-Za-z0-9-]+)", match.group(1))] if match else []
+
+
+def tick_problem(body, box, sender):
+    """Returns why this person can't change this box, or None if they can."""
+    line = QA_LINE if box in QA_BOXES else OWNER_LINE
+    names = people(body, line)
+    if not names:
+        return f"Add a name to `{line}:` first."
+    if box in SIGNOFF_BOXES and set(people(body, OWNER_LINE)) & set(people(body, QA_LINE)):
+        return f"`{OWNER_LINE}` and `{QA_LINE}` must be different people."
+    if sender.lower() not in names:
+        return f"@{sender} isn't the {line}."
+    return None
+
+
+def assign_people(number, issue, body):
+    """Assigns the named people to the ticket. Names GitHub can't assign are skipped."""
+    current = {person["login"].lower() for person in issue["assignees"]}
+    missing = [name for name in people(body, OWNER_LINE) + people(body, QA_LINE) if name not in current]
+    if not missing:
+        return
+    try:
+        api("POST", f"issues/{number}/assignees", {"assignees": missing})
+    except urllib.error.HTTPError:
+        print(f"Couldn't assign {missing}.")
+
+
 def box_ticked(body, box):
     """Returns True or False, or None if the box isn't in the ticket."""
     match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t\r]*$", body, re.M)
@@ -86,7 +119,7 @@ def box_ticked(body, box):
 
 def boxes(body):
     """Returns {box text: ticked} for the sign-off boxes."""
-    found = {box: box_ticked(body, box) for box in APPROVERS}
+    found = {box: box_ticked(body, box) for box in SIGNOFF_BOXES}
     return {box: ticked for box, ticked in found.items() if ticked is not None}
 
 
@@ -101,7 +134,7 @@ def set_box(body, box, ticked):
 
 
 def clear_boxes(body):
-    for box in APPROVERS:
+    for box in SIGNOFF_BOXES:
         body = set_box(body, box, False)
     return body
 
@@ -168,10 +201,9 @@ def create_branch(number, version):
     if branch_sha(branch):
         comment(number, f"`{branch}` already exists, so it wasn't changed.")
         return
-    source = CONFIG["source_branch"]
-    sha = branch_sha(source)
+    sha = branch_sha(SOURCE_BRANCH)
     api("POST", "git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
-    comment(number, f"Created `{branch}` from `{source}` at `{sha[:7]}`.")
+    comment(number, f"Created `{branch}` from `{SOURCE_BRANCH}` at `{sha[:7]}`.")
 
 
 def branch_box(number, before, after, body, sender):
@@ -179,11 +211,10 @@ def branch_box(number, before, after, body, sender):
     if box_ticked(before, BRANCH_BOX) or not box_ticked(after, BRANCH_BOX):
         return body
     version = read_version(body)
-    if sender not in CONFIG["create_branch"]:
-        reason = f"@{sender} can't create the release branch."
-    elif not version:
+    reason = tick_problem(body, BRANCH_BOX, sender)
+    if not reason and not version:
         reason = "Add `Release version: vX.Y.Z` first."
-    else:
+    if not reason:
         create_branch(number, version)
         return body
     comment(number, f"`{BRANCH_BOX}` was changed back: {reason}")
@@ -205,11 +236,14 @@ def signoff(event):
         changed = [box for box in after if before.get(box) != after[box]]
 
     body = live
+    allowed = []
     for box in changed:
-        if sender not in APPROVERS[box]:
+        problem = tick_problem(body, box, sender)
+        if problem:
             body = set_box(body, box, before.get(box, False))
-            comment(number, f"`{box}` was changed back: @{sender} can't sign off this box.")
-    allowed = [box for box in changed if sender in APPROVERS[box]]
+            comment(number, f"`{box}` was changed back: {problem}")
+        else:
+            allowed.append(box)
 
     if event["action"] == "edited":
         old_body = event["changes"]["body"]["from"] or ""
@@ -218,12 +252,13 @@ def signoff(event):
     body, rc_changed = fill_ticket(body)
     if body != live:
         api("PATCH", f"issues/{number}", {"body": body})
+    assign_people(number, issue, body)
     if rc_changed:
         comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")
         return
 
     ticks = boxes(body)
-    if allowed and len(ticks) == len(APPROVERS) and all(ticks.values()):
+    if allowed and len(ticks) == len(SIGNOFF_BOXES) and all(ticks.values()):
         freeze(number, read_version(body), read_rc(body))
 
 

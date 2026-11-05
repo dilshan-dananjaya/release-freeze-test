@@ -9,6 +9,8 @@ assignees: ''
 Release version: v
 Release branch: waiting for version
 Release candidate: waiting for version
+Release Owner: @
+QA Approver: @
 
 ## Prep
 
