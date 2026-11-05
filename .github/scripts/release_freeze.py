@@ -67,12 +67,12 @@ def latest_rc(version):
 
 
 def read_version(body):
-    match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t]*$", body, re.M)
+    match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
     return match.group(1) if match else None
 
 
 def read_rc(body):
-    match = re.search(r"^Release candidate:[ \t]*`([^`]+)`[ \t]*$", body, re.M)
+    match = re.search(r"^Release candidate:[ \t]*`([^`]+)`[ \t\r]*$", body, re.M)
     return match.group(1) if match else None
 
 
@@ -80,7 +80,7 @@ def boxes(body):
     """Returns {box text: ticked} for the sign-off boxes."""
     found = {}
     for box in APPROVERS:
-        match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t]*$", body, re.M)
+        match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t\r]*$", body, re.M)
         if match:
             found[box] = match.group(1) != " "
     return found
@@ -89,7 +89,7 @@ def boxes(body):
 def set_box(body, box, ticked):
     mark = "x" if ticked else " "
     return re.sub(
-        rf"^- \[[ xX]\] {re.escape(box)}([ \t]*)$",
+        rf"^- \[[ xX]\] {re.escape(box)}([ \t\r]*)$",
         lambda match: f"- [{mark}] {box}{match.group(1)}",
         body,
         flags=re.M,
