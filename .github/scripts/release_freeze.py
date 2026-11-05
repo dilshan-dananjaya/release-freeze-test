@@ -14,9 +14,11 @@ TOKEN = os.environ["GITHUB_TOKEN"]
 SIGNOFF_LABEL = "release-sign-off"
 OVERRIDE_LABEL = "freeze-override"
 CHECK_WORKFLOW = "Release freeze check"
+BRANCH_BOX = "Create release branch"
 
 with open(".github/release_signoff.json", encoding="utf-8") as f:
-    APPROVERS = json.load(f)
+    CONFIG = json.load(f)
+APPROVERS = CONFIG["signoff"]
 
 
 def api(method, path, data=None):
@@ -76,14 +78,16 @@ def read_rc(body):
     return match.group(1) if match else None
 
 
+def box_ticked(body, box):
+    """Returns True or False, or None if the box isn't in the ticket."""
+    match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t\r]*$", body, re.M)
+    return match.group(1) != " " if match else None
+
+
 def boxes(body):
     """Returns {box text: ticked} for the sign-off boxes."""
-    found = {}
-    for box in APPROVERS:
-        match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t\r]*$", body, re.M)
-        if match:
-            found[box] = match.group(1) != " "
-    return found
+    found = {box: box_ticked(body, box) for box in APPROVERS}
+    return {box: ticked for box, ticked in found.items() if ticked is not None}
 
 
 def set_box(body, box, ticked):
@@ -159,6 +163,33 @@ def freeze(number, version, rc):
     comment(number, f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
 
 
+def create_branch(number, version):
+    branch = f"release/{version}"
+    if branch_sha(branch):
+        comment(number, f"`{branch}` already exists, so it wasn't changed.")
+        return
+    source = CONFIG["source_branch"]
+    sha = branch_sha(source)
+    api("POST", "git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
+    comment(number, f"Created `{branch}` from `{source}` at `{sha[:7]}`.")
+
+
+def branch_box(number, before, after, body, sender):
+    """Creates the release branch when its box is newly ticked."""
+    if box_ticked(before, BRANCH_BOX) or not box_ticked(after, BRANCH_BOX):
+        return body
+    version = read_version(body)
+    if sender not in CONFIG["create_branch"]:
+        reason = f"@{sender} can't create the release branch."
+    elif not version:
+        reason = "Add `Release version: vX.Y.Z` first."
+    else:
+        create_branch(number, version)
+        return body
+    comment(number, f"`{BRANCH_BOX}` was changed back: {reason}")
+    return set_box(body, BRANCH_BOX, False)
+
+
 def signoff(event):
     issue = event["issue"]
     number = issue["number"]
@@ -179,6 +210,10 @@ def signoff(event):
             body = set_box(body, box, before.get(box, False))
             comment(number, f"`{box}` was changed back: @{sender} can't sign off this box.")
     allowed = [box for box in changed if sender in APPROVERS[box]]
+
+    if event["action"] == "edited":
+        old_body = event["changes"]["body"]["from"] or ""
+        body = branch_box(number, old_body, issue["body"] or "", body, sender)
 
     body, rc_changed = fill_ticket(body)
     if body != live:
