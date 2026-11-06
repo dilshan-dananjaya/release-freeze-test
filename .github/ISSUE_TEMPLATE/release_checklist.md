@@ -1,7 +1,7 @@
 ---
 name: Release checklist
 about: Checklist and sign-off for a new release
-title: 'prep and execution'
+title: 'Release'
 labels: release-sign-off
 assignees: ''
 ---

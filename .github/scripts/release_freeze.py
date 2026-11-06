@@ -24,7 +24,7 @@ OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
 PR_REVIEWER = os.environ.get("PR_REVIEWER", "").lower()
 BLANK_VERSION = "v0.0.0"
-TITLE_START = "prep and execution"
+TITLE_START = "Release"
 
 
 def api(method, path, data=None):
