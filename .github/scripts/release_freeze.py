@@ -22,7 +22,8 @@ QA_BOXES = ["QA approved (product)", "QA approved (client)"]
 SIGNOFF_BOXES = QA_BOXES + [OWNER_BOX]
 OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
-REVIEWER_LINE = "PR Reviewer"
+PR_REVIEWER = os.environ.get("PR_REVIEWER", "").lower()
+BLANK_VERSION = "v0.0.0"
 
 
 def api(method, path, data=None):
@@ -74,7 +75,7 @@ def latest_rc(version):
 
 def read_version(body):
     match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
-    return match.group(1) if match else None
+    return match.group(1) if match and match.group(1) != BLANK_VERSION else None
 
 
 def read_rc(body):
@@ -120,7 +121,7 @@ def assign_people(number, issue, body):
 
 def box_ticked(body, box):
     """Returns True or False, or None if the box isn't in the ticket."""
-    match = re.search(rf"^- \[([ xX])\] {re.escape(box)}[ \t\r]*$", body, re.M)
+    match = re.search(rf"^- \[([ xX])\] {re.escape(box)}([ \t].*)?\r?$", body, re.M)
     return match.group(1) != " " if match else None
 
 
@@ -133,7 +134,7 @@ def boxes(body):
 def set_box(body, box, ticked):
     mark = "x" if ticked else " "
     return re.sub(
-        rf"^- \[[ xX]\] {re.escape(box)}([ \t\r]*)$",
+        rf"^- \[[ xX]\] {re.escape(box)}(.*)$",
         lambda match: f"- [{mark}] {box}{match.group(1)}",
         body,
         flags=re.M,
@@ -144,6 +145,16 @@ def clear_boxes(body):
     for box in SIGNOFF_BOXES:
         body = set_box(body, box, False)
     return body
+
+
+def set_branch_mark(body, mark):
+    """Writes the mark after the branch box, like `- [x] Create release branch ⏳`."""
+    return re.sub(
+        rf"^(- \[[ xX]\] {re.escape(BRANCH_BOX)})[^\r\n]*",
+        lambda match: f"{match.group(1)} {mark}".rstrip(),
+        body,
+        flags=re.M,
+    )
 
 
 def set_line(body, name, value):
@@ -157,8 +168,9 @@ def fill_ticket(body):
         return body, False
     rc = latest_rc(version)
     old_rc = read_rc(body)
-    done = "✅ " if box_ticked(body, BRANCH_BOX) else ""
-    body = set_line(body, "Release branch", f"{done}`release/{version}`")
+    branch = f"release/{version}"
+    link = f"[`{branch}`](https://github.com/{REPO}/tree/{branch}) ✅"
+    body = set_branch_mark(body, link if box_ticked(body, BRANCH_BOX) else "")
     body = set_line(body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC")
     rc_changed = old_rc != rc and any(boxes(body).values())
     if rc_changed:
@@ -233,7 +245,7 @@ def create_release_pr(number, version, body):
     except urllib.error.HTTPError as error:
         comment(number, f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.")
         return
-    reviewers = people(body, REVIEWER_LINE)
+    reviewers = [PR_REVIEWER] if PR_REVIEWER else []
     requested = []
     try:
         if reviewers:
@@ -245,7 +257,7 @@ def create_release_pr(number, version, body):
     if set(reviewers) <= set(requested):
         comment(number, f"Created release PR #{pull['number']}.")
     else:
-        comment(number, f"Created release PR #{pull['number']}, but couldn't request a review from the `{REVIEWER_LINE}`.")
+        comment(number, f"Created release PR #{pull['number']}, but couldn't request a review from `{PR_REVIEWER}`.")
 
 
 def branch_box(number, before, after, body, sender):
@@ -259,7 +271,7 @@ def branch_box(number, before, after, body, sender):
     if not reason and not read_jira(body):
         reason = "Add `Jira ticket: JACM-123` first."
     if not reason:
-        api("PATCH", f"issues/{number}", {"body": set_line(body, "Release branch", f"⏳ creating `release/{version}`")})
+        api("PATCH", f"issues/{number}", {"body": set_branch_mark(body, "⏳")})
         create_branch(number, version)
         create_release_pr(number, version, body)
         return body

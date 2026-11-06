@@ -6,13 +6,11 @@ labels: release-sign-off
 assignees: ''
 ---
 
-Release version: v
+Release version: v0.0.0
 Jira ticket: JACM-
-Release branch: waiting for version
 Release candidate: waiting for version
 Release Owner: @
 QA Approver: @
-PR Reviewer: @sam-riethmuller
 
 ## Prep
 

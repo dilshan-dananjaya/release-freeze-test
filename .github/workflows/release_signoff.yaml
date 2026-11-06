@@ -27,3 +27,4 @@ jobs:
       - run: python3 .github/scripts/release_freeze.py ${{ github.event_name == 'release' && 'new-rc' || 'signoff' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PR_REVIEWER: ${{ vars.RELEASE_PR_REVIEWER }}
