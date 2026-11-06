@@ -15,12 +15,14 @@ SIGNOFF_LABEL = "release-sign-off"
 OVERRIDE_LABEL = "freeze-override"
 CHECK_WORKFLOW = "Release freeze check"
 SOURCE_BRANCH = "dev"
+TARGET_BRANCH = "master"
 BRANCH_BOX = "Create release branch"
 OWNER_BOX = "Release owner approved"
 QA_BOXES = ["QA approved (product)", "QA approved (client)"]
 SIGNOFF_BOXES = QA_BOXES + [OWNER_BOX]
 OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
+REVIEWER_LINE = "PR Reviewer"
 
 
 def api(method, path, data=None):
@@ -77,6 +79,11 @@ def read_version(body):
 
 def read_rc(body):
     match = re.search(r"^Release candidate:[ \t]*`([^`]+)`[ \t\r]*$", body, re.M)
+    return match.group(1) if match else None
+
+
+def read_jira(body):
+    match = re.search(r"^Jira ticket:[ 	]*(JACM-\d+)[ 	]*$", body, re.M)
     return match.group(1) if match else None
 
 
@@ -206,6 +213,36 @@ def create_branch(number, version):
     comment(number, f"Created `{branch}` from `{SOURCE_BRANCH}` at `{sha[:7]}`.")
 
 
+def create_release_pr(number, version, body):
+    """Opens the release PR into master and asks the named reviewer."""
+    branch = f"release/{version}"
+    owner = REPO.split("/")[0]
+    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}", "base": TARGET_BRANCH})
+    found = api("GET", f"pulls?{query}")
+    if found:
+        comment(number, f"Release PR #{found[0]['number']} already exists.")
+        return
+    try:
+        pull = api("POST", "pulls", {
+            "title": f"{read_jira(body)} Release V{version[1:]}",
+            "head": branch,
+            "base": TARGET_BRANCH,
+            "body": f"Release {version}, cut from `{SOURCE_BRANCH}`.
+
+Checklist: #{number}",
+        })
+    except urllib.error.HTTPError as error:
+        comment(number, f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.")
+        return
+    reviewers = people(body, REVIEWER_LINE)
+    try:
+        if reviewers:
+            api("POST", f"pulls/{pull['number']}/requested_reviewers", {"reviewers": reviewers})
+        comment(number, f"Created release PR #{pull['number']}.")
+    except urllib.error.HTTPError:
+        comment(number, f"Created release PR #{pull['number']}, but couldn't request a review from the `{REVIEWER_LINE}`.")
+
+
 def branch_box(number, before, after, body, sender):
     """Creates the release branch when its box is newly ticked."""
     if box_ticked(before, BRANCH_BOX) or not box_ticked(after, BRANCH_BOX):
@@ -214,8 +251,11 @@ def branch_box(number, before, after, body, sender):
     reason = tick_problem(body, BRANCH_BOX, sender)
     if not reason and not version:
         reason = "Add `Release version: vX.Y.Z` first."
+    if not reason and not read_jira(body):
+        reason = "Add `Jira ticket: JACM-123` first."
     if not reason:
         create_branch(number, version)
+        create_release_pr(number, version, body)
         return body
     comment(number, f"`{BRANCH_BOX}` was changed back: {reason}")
     return set_box(body, BRANCH_BOX, False)

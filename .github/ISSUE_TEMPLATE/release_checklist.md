@@ -7,10 +7,12 @@ assignees: ''
 ---
 
 Release version: v
+Jira ticket: JACM-
 Release branch: waiting for version
 Release candidate: waiting for version
 Release Owner: @
 QA Approver: @
+PR Reviewer: @sam-riethmuller
 
 ## Prep
 
