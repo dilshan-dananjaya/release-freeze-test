@@ -205,6 +205,11 @@ def set_line(body, name, value):
     return re.sub(rf"^{name}:.*$", f"{name}: {value}", body, flags=re.M)
 
 
+def frozen_by(number, body, rc):
+    client = read_text(body, "Client") or f"#{number}"
+    return f"🔒 Frozen by [{client}](https://github.com/{REPO}/issues/{number}) on `{rc}`"
+
+
 def show_frozen(body, version, rc):
     """Shows the freeze on a ticket that joined after it, and clears it after a new RC."""
     frozen = tag_sha(f"frozen/{version}")
@@ -214,8 +219,10 @@ def show_frozen(body, version, rc):
         return body
     for issue in version_tickets(version):
         status = read_status(issue["body"] or "")
-        if f"`{rc}`" in status:
+        if "Frozen by" in status and f"`{rc}`" in status:
             return set_status(body, status)
+        if f"`{rc}`" in status:
+            return set_status(body, frozen_by(issue["number"], issue["body"] or "", rc))
     return set_status(body, f"🔒 Frozen on `{rc}`")
 
 
@@ -278,9 +285,8 @@ def freeze(number, body):
     else:
         api("POST", "git/refs", {"ref": f"refs/tags/{frozen}", "sha": head})
     rerun_checks(branch)
-    client = read_text(body, "Client") or f"#{number}"
-    status = f"🔒 Frozen by [{client}](https://github.com/{REPO}/issues/{number}) on `{rc}`"
     for issue in version_tickets(version):
+        status = f"🔒 Frozen on `{rc}`" if issue["number"] == number else frozen_by(number, body, rc)
         api("PATCH", f"issues/{issue['number']}", {"body": set_status(issue["body"] or "", status)})
         comment(issue["number"], f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
 
