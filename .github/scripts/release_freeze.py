@@ -83,7 +83,7 @@ def read_rc(body):
 
 
 def read_jira(body):
-    match = re.search(r"^Jira ticket:[ 	]*(JACM-\d+)[ 	]*$", body, re.M)
+    match = re.search(r"^Jira ticket:[ \t]*(JACM-\d+)[ \t\r]*$", body, re.M)
     return match.group(1) if match else None
 
 
@@ -227,9 +227,7 @@ def create_release_pr(number, version, body):
             "title": f"{read_jira(body)} Release V{version[1:]}",
             "head": branch,
             "base": TARGET_BRANCH,
-            "body": f"Release {version}, cut from `{SOURCE_BRANCH}`.
-
-Checklist: #{number}",
+            "body": f"Release {version}, cut from `{SOURCE_BRANCH}`.\n\nChecklist: #{number}",
         })
     except urllib.error.HTTPError as error:
         comment(number, f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.")
