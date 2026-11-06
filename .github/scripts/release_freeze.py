@@ -24,6 +24,7 @@ OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
 PR_REVIEWER = os.environ.get("PR_REVIEWER", "").lower()
 BLANK_VERSION = "v0.0.0"
+TITLE_START = "prep and execution"
 
 
 def api(method, path, data=None):
@@ -76,6 +77,13 @@ def latest_rc(version):
 def read_version(body):
     match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
     return match.group(1) if match and match.group(1) != BLANK_VERSION else None
+
+
+def ticket_title(body):
+    """Returns the title for the client and version, or None until both are filled in."""
+    match = re.search(r"^Client:[ \t]*([^\r\n]*?)[ \t\r]*$", body, re.M)
+    version = read_version(body)
+    return f"{TITLE_START} {match.group(1)} {version}" if match and match.group(1) and version else None
 
 
 def read_rc(body):
@@ -327,8 +335,14 @@ def signoff(event):
 
     body, rc_changed = fill_ticket(body)
     # Read again: the waiting mark may have changed the ticket since the start.
+    update = {}
     if body != (api("GET", f"issues/{number}")["body"] or ""):
-        api("PATCH", f"issues/{number}", {"body": body})
+        update["body"] = body
+    title = ticket_title(body)
+    if title and title != issue["title"]:
+        update["title"] = title
+    if update:
+        api("PATCH", f"issues/{number}", update)
     assign_people(number, issue, body)
     if rc_changed:
         comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")

@@ -1,11 +1,12 @@
 ---
 name: Release checklist
 about: Checklist and sign-off for a new release
-title: ''
+title: 'prep and execution'
 labels: release-sign-off
 assignees: ''
 ---
 
+Client:
 Release version: v0.0.0
 Jira ticket: JACM-
 Release candidate: waiting for version
