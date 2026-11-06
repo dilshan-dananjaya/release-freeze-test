@@ -187,8 +187,36 @@ def set_mark(body, box, mark):
     )
 
 
+def read_status(body):
+    match = re.search(r"^## Sign-off[ \t]*([^\r\n]*)", body, re.M)
+    return match.group(1) if match else ""
+
+
+def set_status(body, status):
+    return re.sub(
+        r"^## Sign-off[^\r\n]*",
+        lambda match: f"## Sign-off {status}".rstrip(),
+        body,
+        flags=re.M,
+    )
+
+
 def set_line(body, name, value):
     return re.sub(rf"^{name}:.*$", f"{name}: {value}", body, flags=re.M)
+
+
+def show_frozen(body, version, rc):
+    """Shows the freeze on a ticket that joined after it, and clears it after a new RC."""
+    frozen = tag_sha(f"frozen/{version}")
+    if not rc or not frozen or frozen != tag_sha(rc):
+        return set_status(body, "")
+    if f"`{rc}`" in read_status(body):
+        return body
+    for issue in version_tickets(version):
+        status = read_status(issue["body"] or "")
+        if f"`{rc}`" in status:
+            return set_status(body, status)
+    return set_status(body, f"🔒 Frozen on `{rc}`")
 
 
 def fill_ticket(body):
@@ -205,7 +233,7 @@ def fill_ticket(body):
     rc_changed = old_rc != rc and any(boxes(body).values())
     if rc_changed:
         body = clear_boxes(body)
-    return body, rc_changed
+    return show_frozen(body, version, rc), rc_changed
 
 
 def comment(number, text):
@@ -228,16 +256,18 @@ def rerun_checks(branch):
             api("POST", f"actions/runs/{runs[0]['id']}/rerun", {})
 
 
-def freeze(numbers, version, rc):
+def freeze(number, body):
+    version = read_version(body)
+    rc = read_rc(body)
     branch = f"release/{version}"
     head = branch_sha(branch)
     rc_commit = tag_sha(rc) if rc else None
     if not head or not rc_commit:
-        comment_all(numbers, f"Not frozen: `{branch}` or its RC doesn't exist yet.")
+        comment(number, f"Not frozen: `{branch}` or its RC doesn't exist yet.")
         return
     if head != rc_commit:
-        comment_all(
-            numbers,
+        comment(
+            number,
             f"Not frozen: `{branch}` has moved past `{rc}`. "
             "Create a new RC, test it and sign off again.",
         )
@@ -248,7 +278,11 @@ def freeze(numbers, version, rc):
     else:
         api("POST", "git/refs", {"ref": f"refs/tags/{frozen}", "sha": head})
     rerun_checks(branch)
-    comment_all(numbers, f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
+    client = read_text(body, "Client") or f"#{number}"
+    status = f"🔒 Frozen by [{client}](https://github.com/{REPO}/issues/{number}) on `{rc}`"
+    for issue in version_tickets(version):
+        api("PATCH", f"issues/{issue['number']}", {"body": set_status(issue["body"] or "", status)})
+        comment(issue["number"], f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
 
 
 def version_tickets(version):
@@ -262,24 +296,9 @@ def signed_off(body):
     return len(ticks) == len(FREEZE_BOXES) and all(ticks.values())
 
 
-def freeze_when_ready(version, number=None):
-    """Freezes once every open ticket for this version is signed off.
-
-    `number` is the ticket that just signed off. Without it, a ticket moved
-    away or closed, so this only acts if the branch isn't frozen on the RC yet.
-    """
-    tickets = version_tickets(version)
-    waiting = [f"#{issue['number']}" for issue in tickets if not signed_off(issue["body"] or "")]
-    if waiting:
-        if number:
-            comment(number, f"Signed off. Waiting for {', '.join(waiting)}.")
-        return
-    if not tickets:
-        return
-    rc = read_rc(tickets[0]["body"] or "")
-    if not number and (not rc or tag_sha(f"frozen/{version}") == tag_sha(rc)):
-        return
-    freeze([issue["number"] for issue in tickets], version, rc)
+def already_frozen(body):
+    rc = read_rc(body)
+    return bool(rc) and tag_sha(f"frozen/{read_version(body)}") == tag_sha(rc)
 
 
 def create_branch(number, version):
@@ -396,11 +415,6 @@ def signoff(event):
     issue = event["issue"]
     number = issue["number"]
     sender = event["sender"]["login"]
-    if event["action"] == "closed":
-        version = read_version(issue["body"] or "")
-        if version:
-            freeze_when_ready(version)
-        return
     live = api("GET", f"issues/{number}")["body"] or ""
 
     changed = []
@@ -421,7 +435,6 @@ def signoff(event):
         else:
             allowed.append(box)
 
-    old_body = ""
     if event["action"] == "edited":
         old_body = event["changes"]["body"]["from"] or ""
         body = reset_version(number, old_body, body)
@@ -444,11 +457,8 @@ def signoff(event):
         comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")
         return
 
-    old_version = read_version(old_body)
-    if old_version and old_version != read_version(body):
-        freeze_when_ready(old_version)
-    if allowed and signed_off(body):
-        freeze_when_ready(read_version(body), number)
+    if allowed and signed_off(body) and not already_frozen(body):
+        freeze(number, body)
 
 
 def new_rc(event):
