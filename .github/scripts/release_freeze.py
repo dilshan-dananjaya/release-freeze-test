@@ -481,11 +481,20 @@ def new_rc(event):
             )
 
 
+def version_numbers(tag):
+    return [int(part) for part in re.findall(r"\d+", tag)[:3]]
+
+
 def is_older(version):
     """A merged release PR can also close an older one, which must not become Latest."""
     latest = api("GET", "releases/latest")
-    numbers = lambda tag: [int(part) for part in re.findall(r"\d+", tag)[:3]]
-    return bool(latest) and numbers(version) < numbers(latest["tag_name"])
+    return bool(latest) and version_numbers(version) < version_numbers(latest["tag_name"])
+
+
+def newest_frozen(version):
+    """These runs can finish in any order, so a newer frozen version keeps the Latest label."""
+    refs = api("GET", "git/matching-refs/tags/frozen/") or []
+    return all(version_numbers(ref["ref"]) <= version_numbers(version) for ref in refs)
 
 
 def publish(event):
@@ -511,7 +520,7 @@ def publish(event):
                 "tag_name": version,
                 "target_commitish": frozen,
                 "name": version,
-                "make_latest": "true",
+                "make_latest": "true" if newest_frozen(version) else "false",
                 "generate_release_notes": True,
             })
             comment_all(numbers, f"Published [`{version}`]({release['html_url']}) as the latest release.")
