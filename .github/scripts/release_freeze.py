@@ -19,6 +19,7 @@ SOURCE_BRANCH = "dev"
 TARGET_BRANCH = "master"
 BRANCH_BOX = "Create release branch"
 ADHOC_BOX = "Adhoc steps"
+MERGE_BOX = "Merge release to master"
 OWNER_BOX = "Release owner approved"
 QA_BOXES = ["QA approved"]
 SIGNOFF_BOXES = QA_BOXES + [OWNER_BOX]
@@ -139,9 +140,14 @@ def assign_people(number, issue, body):
         print(f"Couldn't assign {missing}.")
 
 
+def box_text(box):
+    """Matches the box text, which may have become a link."""
+    return rf"\[?{re.escape(box)}(?:\]\([^)\s]*\))?"
+
+
 def box_ticked(body, box):
     """Returns True or False, or None if the box isn't in the ticket."""
-    match = re.search(rf"^- \[([ xX])\] {re.escape(box)}([ \t].*)?\r?$", body, re.M)
+    match = re.search(rf"^- \[([ xX])\] {box_text(box)}([ \t:].*)?\r?$", body, re.M)
     return match.group(1) != " " if match else None
 
 
@@ -154,8 +160,8 @@ def boxes(body):
 def set_box(body, box, ticked):
     mark = "x" if ticked else " "
     return re.sub(
-        rf"^- \[[ xX]\] {re.escape(box)}(.*)$",
-        lambda match: f"- [{mark}] {box}{match.group(1)}",
+        rf"^- \[[ xX]\] ({box_text(box)}.*)$",
+        lambda match: f"- [{mark}] {match.group(1)}",
         body,
         flags=re.M,
     )
@@ -168,10 +174,10 @@ def clear_boxes(body):
 
 
 def set_mark(body, box, mark):
-    """Writes the mark after a box, like `- [x] Create release branch ⏳`."""
+    """Writes the mark after a box, like `- [x] Create release branch: ⏳`."""
     return re.sub(
         rf"^(- \[[ xX]\] {re.escape(box)})[^\r\n]*",
-        lambda match: f"{match.group(1)} {mark}".rstrip(),
+        lambda match: f"{match.group(1)}: {mark}" if mark else match.group(1),
         body,
         flags=re.M,
     )
@@ -268,12 +274,12 @@ def update_pr_title(old_body, body):
 
 
 def create_release_pr(number, version, body):
-    """Opens the release PR into master and asks the reviewer."""
+    """Opens the release PR into master, asks the reviewer and returns the PR."""
     branch = f"release/{version}"
     found = find_release_pr(version)
     if found:
         comment(number, f"Release PR #{found['number']} already exists.")
-        return
+        return found
     try:
         pull = api("POST", "pulls", {
             "title": release_title(version, read_jira(body)),
@@ -283,7 +289,7 @@ def create_release_pr(number, version, body):
         })
     except urllib.error.HTTPError as error:
         comment(number, f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.")
-        return
+        return None
     reviewers = [PR_REVIEWER] if PR_REVIEWER else []
     requested = []
     try:
@@ -297,6 +303,7 @@ def create_release_pr(number, version, body):
         comment(number, f"Created release PR #{pull['number']}.")
     else:
         comment(number, f"Created release PR #{pull['number']}, but couldn't request a review from `{PR_REVIEWER}`.")
+    return pull
 
 
 def branch_box(number, before, after, body, sender):
@@ -310,8 +317,8 @@ def branch_box(number, before, after, body, sender):
     if not reason:
         api("PATCH", f"issues/{number}", {"body": set_mark(body, BRANCH_BOX, "⏳")})
         create_branch(number, version)
-        create_release_pr(number, version, body)
-        return body
+        pull = create_release_pr(number, version, body)
+        return set_mark(body, MERGE_BOX, f"[PR #{pull['number']}]({pull['html_url']})") if pull else body
     comment(number, f"`{BRANCH_BOX}` was changed back: {reason}")
     return set_box(body, BRANCH_BOX, False)
 
@@ -320,14 +327,19 @@ def adhoc_box(number, before, after, body):
     """Creates the adhoc steps ticket when its box is newly ticked."""
     if box_ticked(before, ADHOC_BOX) or not box_ticked(after, ADHOC_BOX):
         return body
-    if re.search(rf"^- \[[ xX]\] {ADHOC_BOX} \[", body, re.M):
+    if re.search(rf"^- \[[ xX]\] \[{ADHOC_BOX}\]", body, re.M):
         return body
     release = client_release(body)
     if not release:
         comment(number, f"`{ADHOC_BOX}` was changed back: Add `Client:` and `Client version:` first.")
         return set_box(body, ADHOC_BOX, False)
     ticket = api("POST", "issues", {"title": f"{ADHOC_BOX} for {release}", "body": f"{ADHOC_BOX} for #{number}."})
-    return set_mark(body, ADHOC_BOX, f"[for {release}]({ticket['html_url']}) ✅")
+    return re.sub(
+        rf"^(- \[[ xX]\] ){ADHOC_BOX}",
+        lambda match: f"{match.group(1)}[{ADHOC_BOX}]({ticket['html_url']})",
+        body,
+        flags=re.M,
+    )
 
 
 def signoff(event):

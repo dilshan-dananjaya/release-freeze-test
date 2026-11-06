@@ -30,5 +30,6 @@ The branch freezes after both boxes are ticked. Keep this wording.
 
 ## Release
 
+- [ ] Merge release to master
 - [ ] Execute runsheet
 - [ ] Prod release done
