@@ -24,7 +24,7 @@ QA Approver: @
 
 ## Sign-off
 
-The branch freezes after QA approved and Release owner approved are ticked. Keep this wording.
+The branch freezes after E2E run, QA approved and Release owner approved are ticked. Keep this wording.
 
 - [ ] E2E run
 - [ ] Release Note and comms

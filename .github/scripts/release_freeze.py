@@ -23,6 +23,8 @@ MERGE_BOX = "Merge release to master"
 OWNER_BOX = "Release owner approved"
 QA_BOXES = ["QA approved"]
 SIGNOFF_BOXES = QA_BOXES + [OWNER_BOX]
+E2E_BOX = "E2E run"
+FREEZE_BOXES = SIGNOFF_BOXES + [E2E_BOX]
 OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
 PR_REVIEWER = os.environ.get("PR_REVIEWER", "").lower()
@@ -117,6 +119,8 @@ def people(body, line):
 
 def tick_problem(body, box, sender):
     """Returns why this person can't change this box, or None if they can."""
+    if box == E2E_BOX:
+        return None
     line = QA_LINE if box in QA_BOXES else OWNER_LINE
     names = people(body, line)
     if not names:
@@ -152,8 +156,8 @@ def box_ticked(body, box):
 
 
 def boxes(body):
-    """Returns {box text: ticked} for the sign-off boxes."""
-    found = {box: box_ticked(body, box) for box in SIGNOFF_BOXES}
+    """Returns {box text: ticked} for the boxes the freeze needs."""
+    found = {box: box_ticked(body, box) for box in FREEZE_BOXES}
     return {box: ticked for box, ticked in found.items() if ticked is not None}
 
 
@@ -168,7 +172,7 @@ def set_box(body, box, ticked):
 
 
 def clear_boxes(body):
-    for box in SIGNOFF_BOXES:
+    for box in FREEZE_BOXES:
         body = set_box(body, box, False)
     return body
 
@@ -388,7 +392,7 @@ def signoff(event):
         return
 
     ticks = boxes(body)
-    if allowed and len(ticks) == len(SIGNOFF_BOXES) and all(ticks.values()):
+    if allowed and len(ticks) == len(FREEZE_BOXES) and all(ticks.values()):
         freeze(number, read_version(body), read_rc(body))
 
 
