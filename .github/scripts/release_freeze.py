@@ -24,6 +24,7 @@ OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
 PR_REVIEWER = os.environ.get("PR_REVIEWER", "").lower()
 BLANK_VERSION = "v0.0.0"
+TITLE_START = "Release"
 
 
 def api(method, path, data=None):
@@ -74,8 +75,20 @@ def latest_rc(version):
 
 
 def read_version(body):
-    match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
+    match = re.search(r"^jahanVerse version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
     return match.group(1) if match and match.group(1) != BLANK_VERSION else None
+
+
+def read_text(body, line):
+    match = re.search(rf"^{line}:[ \t]*([^\r\n]*?)[ \t\r]*$", body, re.M)
+    return match.group(1) if match else ""
+
+
+def ticket_title(body):
+    """Returns the title for the client and its version, or None until both are filled in."""
+    client = read_text(body, "Client")
+    version = read_text(body, "Client version")
+    return f"{TITLE_START} {client} {version}" if client and version not in ("", BLANK_VERSION) else None
 
 
 def read_rc(body):
@@ -286,7 +299,7 @@ def branch_box(number, before, after, body, sender):
     version = read_version(body)
     reason = tick_problem(body, BRANCH_BOX, sender)
     if not reason and not version:
-        reason = "Add `Release version: vX.Y.Z` first."
+        reason = "Add `jahanVerse version: vX.Y.Z` first."
     if not reason:
         api("PATCH", f"issues/{number}", {"body": set_branch_mark(body, "⏳")})
         create_branch(number, version)
@@ -327,8 +340,14 @@ def signoff(event):
 
     body, rc_changed = fill_ticket(body)
     # Read again: the waiting mark may have changed the ticket since the start.
+    update = {}
     if body != (api("GET", f"issues/{number}")["body"] or ""):
-        api("PATCH", f"issues/{number}", {"body": body})
+        update["body"] = body
+    title = ticket_title(body)
+    if title and title != issue["title"]:
+        update["title"] = title
+    if update:
+        api("PATCH", f"issues/{number}", update)
     assign_people(number, issue, body)
     if rc_changed:
         comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")
