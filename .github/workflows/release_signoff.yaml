@@ -2,7 +2,7 @@ name: Release sign-off
 
 on:
   issues:
-    types: [opened, edited]
+    types: [opened, edited, closed]
   release:
     types: [published]
   pull_request_target:

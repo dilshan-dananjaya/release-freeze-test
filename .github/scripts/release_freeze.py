@@ -212,6 +212,11 @@ def comment(number, text):
     api("POST", f"issues/{number}/comments", {"body": text})
 
 
+def comment_all(numbers, text):
+    for number in numbers:
+        comment(number, text)
+
+
 def rerun_checks(branch):
     """Open PRs that passed before the freeze must be checked again."""
     query = urllib.parse.urlencode({"state": "open", "base": branch, "per_page": 100})
@@ -223,16 +228,16 @@ def rerun_checks(branch):
             api("POST", f"actions/runs/{runs[0]['id']}/rerun", {})
 
 
-def freeze(number, version, rc):
+def freeze(numbers, version, rc):
     branch = f"release/{version}"
     head = branch_sha(branch)
     rc_commit = tag_sha(rc) if rc else None
     if not head or not rc_commit:
-        comment(number, f"Not frozen: `{branch}` or its RC doesn't exist yet.")
+        comment_all(numbers, f"Not frozen: `{branch}` or its RC doesn't exist yet.")
         return
     if head != rc_commit:
-        comment(
-            number,
+        comment_all(
+            numbers,
             f"Not frozen: `{branch}` has moved past `{rc}`. "
             "Create a new RC, test it and sign off again.",
         )
@@ -243,7 +248,38 @@ def freeze(number, version, rc):
     else:
         api("POST", "git/refs", {"ref": f"refs/tags/{frozen}", "sha": head})
     rerun_checks(branch)
-    comment(number, f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
+    comment_all(numbers, f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
+
+
+def version_tickets(version):
+    """Returns the open tickets for this jahanVerse version."""
+    query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
+    return [issue for issue in api("GET", f"issues?{query}") if read_version(issue["body"] or "") == version]
+
+
+def signed_off(body):
+    ticks = boxes(body)
+    return len(ticks) == len(FREEZE_BOXES) and all(ticks.values())
+
+
+def freeze_when_ready(version, number=None):
+    """Freezes once every open ticket for this version is signed off.
+
+    `number` is the ticket that just signed off. Without it, a ticket moved
+    away or closed, so this only acts if the branch isn't frozen on the RC yet.
+    """
+    tickets = version_tickets(version)
+    waiting = [f"#{issue['number']}" for issue in tickets if not signed_off(issue["body"] or "")]
+    if waiting:
+        if number:
+            comment(number, f"Signed off. Waiting for {', '.join(waiting)}.")
+        return
+    if not tickets:
+        return
+    rc = read_rc(tickets[0]["body"] or "")
+    if not number and (not rc or tag_sha(f"frozen/{version}") == tag_sha(rc)):
+        return
+    freeze([issue["number"] for issue in tickets], version, rc)
 
 
 def create_branch(number, version):
@@ -270,7 +306,7 @@ def find_release_pr(version):
 def update_pr_title(old_body, body):
     """Keeps the release PR title in step with the ticket's Jira number."""
     version = read_version(body)
-    if not version or read_jira(old_body) == read_jira(body):
+    if not version or version != read_version(old_body) or read_jira(old_body) == read_jira(body):
         return
     pull = find_release_pr(version)
     if pull:
@@ -327,6 +363,16 @@ def branch_box(number, before, after, body, sender):
     return set_box(body, BRANCH_BOX, False)
 
 
+def reset_version(number, old_body, body):
+    """A new version needs its own branch, PR and Jira number."""
+    if not box_ticked(old_body, BRANCH_BOX) or read_version(old_body) == read_version(body):
+        return body
+    body = clear_boxes(set_box(set_box(body, BRANCH_BOX, False), MERGE_BOX, False))
+    body = set_mark(set_mark(body, BRANCH_BOX, ""), MERGE_BOX, "")
+    comment(number, f"Version changed, tick `{BRANCH_BOX}`.")
+    return set_line(body, "Jira ticket", "JACM-")
+
+
 def adhoc_box(number, before, after, body):
     """Creates the adhoc steps ticket when its box is newly ticked."""
     if box_ticked(before, ADHOC_BOX) or not box_ticked(after, ADHOC_BOX):
@@ -350,6 +396,11 @@ def signoff(event):
     issue = event["issue"]
     number = issue["number"]
     sender = event["sender"]["login"]
+    if event["action"] == "closed":
+        version = read_version(issue["body"] or "")
+        if version:
+            freeze_when_ready(version)
+        return
     live = api("GET", f"issues/{number}")["body"] or ""
 
     changed = []
@@ -370,8 +421,10 @@ def signoff(event):
         else:
             allowed.append(box)
 
+    old_body = ""
     if event["action"] == "edited":
         old_body = event["changes"]["body"]["from"] or ""
+        body = reset_version(number, old_body, body)
         body = branch_box(number, old_body, issue["body"] or "", body, sender)
         body = adhoc_box(number, old_body, issue["body"] or "", body)
         update_pr_title(old_body, body)
@@ -391,9 +444,11 @@ def signoff(event):
         comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")
         return
 
-    ticks = boxes(body)
-    if allowed and len(ticks) == len(FREEZE_BOXES) and all(ticks.values()):
-        freeze(number, read_version(body), read_rc(body))
+    old_version = read_version(old_body)
+    if old_version and old_version != read_version(body):
+        freeze_when_ready(old_version)
+    if allowed and signed_off(body):
+        freeze_when_ready(read_version(body), number)
 
 
 def new_rc(event):
@@ -416,14 +471,6 @@ def new_rc(event):
             )
 
 
-def find_ticket(version):
-    query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
-    for issue in api("GET", f"issues?{query}"):
-        if read_version(issue["body"] or "") == version:
-            return issue["number"]
-    return None
-
-
 def is_older(version):
     """A merged release PR can also close an older one, which must not become Latest."""
     latest = api("GET", "releases/latest")
@@ -438,16 +485,16 @@ def publish(event):
     if not match:
         return
     version = match.group(1)
-    number = find_ticket(version) or pull["number"]
+    numbers = [issue["number"] for issue in version_tickets(version)] or [pull["number"]]
     frozen = tag_sha(f"frozen/{version}")
     if tag_sha(version):
-        comment(number, f"`{version}` already exists, so nothing was published.")
+        comment_all(numbers, f"`{version}` already exists, so nothing was published.")
     elif is_older(version):
-        comment(number, f"`{version}` wasn't published: it's older than the latest release.")
+        comment_all(numbers, f"`{version}` wasn't published: it's older than the latest release.")
     elif not frozen:
-        comment(number, f"`{version}` wasn't published: it has no sign-off.")
+        comment_all(numbers, f"`{version}` wasn't published: it has no sign-off.")
     elif frozen != pull["head"]["sha"]:
-        comment(number, f"`{version}` wasn't published: the PR has commits that aren't in the approved RC.")
+        comment_all(numbers, f"`{version}` wasn't published: the PR has commits that aren't in the approved RC.")
     else:
         try:
             release = api("POST", "releases", {
@@ -457,9 +504,9 @@ def publish(event):
                 "make_latest": "true",
                 "generate_release_notes": True,
             })
-            comment(number, f"Published [`{version}`]({release['html_url']}) as the latest release.")
+            comment_all(numbers, f"Published [`{version}`]({release['html_url']}) as the latest release.")
         except urllib.error.HTTPError as error:
-            comment(number, f"Couldn't publish `{version}` ({error.code}).")
+            comment_all(numbers, f"Couldn't publish `{version}` ({error.code}).")
 
 
 def fail(message):
