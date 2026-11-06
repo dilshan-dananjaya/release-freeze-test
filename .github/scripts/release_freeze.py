@@ -75,15 +75,20 @@ def latest_rc(version):
 
 
 def read_version(body):
-    match = re.search(r"^Release version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
+    match = re.search(r"^jahanVerse version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
     return match.group(1) if match and match.group(1) != BLANK_VERSION else None
 
 
+def read_text(body, line):
+    match = re.search(rf"^{line}:[ \t]*([^\r\n]*?)[ \t\r]*$", body, re.M)
+    return match.group(1) if match else ""
+
+
 def ticket_title(body):
-    """Returns the title for the client and version, or None until both are filled in."""
-    match = re.search(r"^Client:[ \t]*([^\r\n]*?)[ \t\r]*$", body, re.M)
-    version = read_version(body)
-    return f"{TITLE_START} {match.group(1)} {version}" if match and match.group(1) and version else None
+    """Returns the title for the client and its version, or None until both are filled in."""
+    client = read_text(body, "Client")
+    version = read_text(body, "Client version")
+    return f"{TITLE_START} {client} {version}" if client and version not in ("", BLANK_VERSION) else None
 
 
 def read_rc(body):
@@ -294,7 +299,7 @@ def branch_box(number, before, after, body, sender):
     version = read_version(body)
     reason = tick_problem(body, BRANCH_BOX, sender)
     if not reason and not version:
-        reason = "Add `Release version: vX.Y.Z` first."
+        reason = "Add `jahanVerse version: vX.Y.Z` first."
     if not reason:
         api("PATCH", f"issues/{number}", {"body": set_branch_mark(body, "⏳")})
         create_branch(number, version)
