@@ -18,8 +18,9 @@ CHECK_WORKFLOW = "Release freeze check"
 SOURCE_BRANCH = "dev"
 TARGET_BRANCH = "master"
 BRANCH_BOX = "Create release branch"
+ADHOC_BOX = "Adhoc steps"
 OWNER_BOX = "Release owner approved"
-QA_BOXES = ["QA approved (product)", "QA approved (client)"]
+QA_BOXES = ["QA approved"]
 SIGNOFF_BOXES = QA_BOXES + [OWNER_BOX]
 OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
@@ -85,11 +86,16 @@ def read_text(body, line):
     return match.group(1) if match else ""
 
 
-def ticket_title(body):
-    """Returns the title for the client and its version, or None until both are filled in."""
+def client_release(body):
+    """Returns the client and its version, or None until both are filled in."""
     client = read_text(body, "Client")
     version = read_text(body, "Client version")
-    return f"{TITLE_START} {client} {version}" if client and version not in ("", BLANK_VERSION) else None
+    return f"{client} {version}" if client and version not in ("", BLANK_VERSION) else None
+
+
+def ticket_title(body):
+    release = client_release(body)
+    return f"{TITLE_START} {release}" if release else None
 
 
 def read_rc(body):
@@ -161,10 +167,10 @@ def clear_boxes(body):
     return body
 
 
-def set_branch_mark(body, mark):
-    """Writes the mark after the branch box, like `- [x] Create release branch ⏳`."""
+def set_mark(body, box, mark):
+    """Writes the mark after a box, like `- [x] Create release branch ⏳`."""
     return re.sub(
-        rf"^(- \[[ xX]\] {re.escape(BRANCH_BOX)})[^\r\n]*",
+        rf"^(- \[[ xX]\] {re.escape(box)})[^\r\n]*",
         lambda match: f"{match.group(1)} {mark}".rstrip(),
         body,
         flags=re.M,
@@ -184,7 +190,7 @@ def fill_ticket(body):
     old_rc = read_rc(body)
     branch = f"release/{version}"
     link = f"[`{branch}`](https://github.com/{REPO}/tree/{branch}) ✅"
-    body = set_branch_mark(body, link if box_ticked(body, BRANCH_BOX) else "")
+    body = set_mark(body, BRANCH_BOX, link if box_ticked(body, BRANCH_BOX) else "")
     body = set_line(body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC")
     rc_changed = old_rc != rc and any(boxes(body).values())
     if rc_changed:
@@ -302,12 +308,26 @@ def branch_box(number, before, after, body, sender):
     if not reason and not version:
         reason = "Add `jahanVerse version: vX.Y.Z` first."
     if not reason:
-        api("PATCH", f"issues/{number}", {"body": set_branch_mark(body, "⏳")})
+        api("PATCH", f"issues/{number}", {"body": set_mark(body, BRANCH_BOX, "⏳")})
         create_branch(number, version)
         create_release_pr(number, version, body)
         return body
     comment(number, f"`{BRANCH_BOX}` was changed back: {reason}")
     return set_box(body, BRANCH_BOX, False)
+
+
+def adhoc_box(number, before, after, body):
+    """Creates the adhoc steps ticket when its box is newly ticked."""
+    if box_ticked(before, ADHOC_BOX) or not box_ticked(after, ADHOC_BOX):
+        return body
+    if re.search(rf"^- \[[ xX]\] {ADHOC_BOX} \[", body, re.M):
+        return body
+    release = client_release(body)
+    if not release:
+        comment(number, f"`{ADHOC_BOX}` was changed back: Add `Client:` and `Client version:` first.")
+        return set_box(body, ADHOC_BOX, False)
+    ticket = api("POST", "issues", {"title": f"{ADHOC_BOX} for {release}", "body": f"{ADHOC_BOX} for #{number}."})
+    return set_mark(body, ADHOC_BOX, f"[for {release}]({ticket['html_url']}) ✅")
 
 
 def signoff(event):
@@ -337,6 +357,7 @@ def signoff(event):
     if event["action"] == "edited":
         old_body = event["changes"]["body"]["from"] or ""
         body = branch_box(number, old_body, issue["body"] or "", body, sender)
+        body = adhoc_box(number, old_body, issue["body"] or "", body)
         update_pr_title(old_body, body)
 
     body, rc_changed = fill_ticket(body)
