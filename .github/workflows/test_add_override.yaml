@@ -1,0 +1,20 @@
+name: Test only - add override as another account
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        required: true
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label freeze-override
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
