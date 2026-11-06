@@ -226,18 +226,37 @@ def create_branch(number, version):
     comment(number, f"Created `{branch}` from `{SOURCE_BRANCH}` at `{sha[:7]}`.")
 
 
-def create_release_pr(number, version, body):
-    """Opens the release PR into master and asks the named reviewer."""
-    branch = f"release/{version}"
+def release_title(version, jira):
+    return f"{jira or 'JACM-XXX'} Release V{version[1:]}"
+
+
+def find_release_pr(version):
     owner = REPO.split("/")[0]
-    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}", "base": TARGET_BRANCH})
+    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:release/{version}", "base": TARGET_BRANCH})
     found = api("GET", f"pulls?{query}")
+    return found[0] if found else None
+
+
+def update_pr_title(old_body, body):
+    """Keeps the release PR title in step with the ticket's Jira number."""
+    version = read_version(body)
+    if not version or read_jira(old_body) == read_jira(body):
+        return
+    pull = find_release_pr(version)
+    if pull:
+        api("PATCH", f"pulls/{pull['number']}", {"title": release_title(version, read_jira(body))})
+
+
+def create_release_pr(number, version, body):
+    """Opens the release PR into master and asks the reviewer."""
+    branch = f"release/{version}"
+    found = find_release_pr(version)
     if found:
-        comment(number, f"Release PR #{found[0]['number']} already exists.")
+        comment(number, f"Release PR #{found['number']} already exists.")
         return
     try:
         pull = api("POST", "pulls", {
-            "title": f"{read_jira(body)} Release V{version[1:]}",
+            "title": release_title(version, read_jira(body)),
             "head": branch,
             "base": TARGET_BRANCH,
             "body": f"Release {version}, cut from `{SOURCE_BRANCH}`.\n\nChecklist: #{number}",
@@ -268,8 +287,6 @@ def branch_box(number, before, after, body, sender):
     reason = tick_problem(body, BRANCH_BOX, sender)
     if not reason and not version:
         reason = "Add `Release version: vX.Y.Z` first."
-    if not reason and not read_jira(body):
-        reason = "Add `Jira ticket: JACM-123` first."
     if not reason:
         api("PATCH", f"issues/{number}", {"body": set_branch_mark(body, "⏳")})
         create_branch(number, version)
@@ -306,6 +323,7 @@ def signoff(event):
     if event["action"] == "edited":
         old_body = event["changes"]["body"]["from"] or ""
         body = branch_box(number, old_body, issue["body"] or "", body, sender)
+        update_pr_title(old_body, body)
 
     body, rc_changed = fill_ticket(body)
     # Read again: the waiting mark may have changed the ticket since the start.
@@ -339,6 +357,43 @@ def new_rc(event):
                 issue["number"],
                 f"The RC is now `{read_rc(new_body)}`, so the sign-off ticks were cleared.",
             )
+
+
+def find_ticket(version):
+    query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
+    for issue in api("GET", f"issues?{query}"):
+        if read_version(issue["body"] or "") == version:
+            return issue["number"]
+    return None
+
+
+def publish(event):
+    """Publishes the final release after the release PR is merged."""
+    pull = event["pull_request"]
+    match = re.fullmatch(r"release/(v\d+\.\d+\.\d+)", pull["head"]["ref"])
+    if not match:
+        return
+    version = match.group(1)
+    number = find_ticket(version) or pull["number"]
+    frozen = tag_sha(f"frozen/{version}")
+    if tag_sha(version):
+        comment(number, f"`{version}` already exists, so nothing was published.")
+    elif not frozen:
+        comment(number, f"`{version}` wasn't published: it has no sign-off.")
+    elif frozen != pull["head"]["sha"]:
+        comment(number, f"`{version}` wasn't published: the PR has commits that aren't in the approved RC.")
+    else:
+        try:
+            release = api("POST", "releases", {
+                "tag_name": version,
+                "target_commitish": frozen,
+                "name": version,
+                "make_latest": "true",
+                "generate_release_notes": True,
+            })
+            comment(number, f"Published [`{version}`]({release['html_url']}) as the latest release.")
+        except urllib.error.HTTPError as error:
+            comment(number, f"Couldn't publish `{version}` ({error.code}).")
 
 
 def fail(message):
@@ -396,7 +451,7 @@ def main():
         return
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
         event = json.load(f)
-    {"signoff": signoff, "new-rc": new_rc, "check": check}[command](event)
+    {"signoff": signoff, "new-rc": new_rc, "check": check, "publish": publish}[command](event)
 
 
 if __name__ == "__main__":
