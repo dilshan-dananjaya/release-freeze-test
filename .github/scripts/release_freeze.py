@@ -157,7 +157,8 @@ def fill_ticket(body):
         return body, False
     rc = latest_rc(version)
     old_rc = read_rc(body)
-    body = set_line(body, "Release branch", f"`release/{version}`")
+    done = "✅ " if box_ticked(body, BRANCH_BOX) else ""
+    body = set_line(body, "Release branch", f"{done}`release/{version}`")
     body = set_line(body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC")
     rc_changed = old_rc != rc and any(boxes(body).values())
     if rc_changed:
@@ -258,6 +259,7 @@ def branch_box(number, before, after, body, sender):
     if not reason and not read_jira(body):
         reason = "Add `Jira ticket: JACM-123` first."
     if not reason:
+        api("PATCH", f"issues/{number}", {"body": set_line(body, "Release branch", f"⏳ creating `release/{version}`")})
         create_branch(number, version)
         create_release_pr(number, version, body)
         return body
@@ -294,7 +296,8 @@ def signoff(event):
         body = branch_box(number, old_body, issue["body"] or "", body, sender)
 
     body, rc_changed = fill_ticket(body)
-    if body != live:
+    # Read again: the waiting mark may have changed the ticket since the start.
+    if body != (api("GET", f"issues/{number}")["body"] or ""):
         api("PATCH", f"issues/{number}", {"body": body})
     assign_people(number, issue, body)
     if rc_changed:
