@@ -367,6 +367,13 @@ def find_ticket(version):
     return None
 
 
+def is_older(version):
+    """A merged release PR can also close an older one, which must not become Latest."""
+    latest = api("GET", "releases/latest")
+    numbers = lambda tag: [int(part) for part in re.findall(r"\d+", tag)[:3]]
+    return bool(latest) and numbers(version) < numbers(latest["tag_name"])
+
+
 def publish(event):
     """Publishes the final release after the release PR is merged."""
     pull = event["pull_request"]
@@ -378,6 +385,8 @@ def publish(event):
     frozen = tag_sha(f"frozen/{version}")
     if tag_sha(version):
         comment(number, f"`{version}` already exists, so nothing was published.")
+    elif is_older(version):
+        comment(number, f"`{version}` wasn't published: it's older than the latest release.")
     elif not frozen:
         comment(number, f"`{version}` wasn't published: it has no sign-off.")
     elif frozen != pull["head"]["sha"]:
