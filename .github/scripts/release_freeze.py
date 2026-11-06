@@ -13,6 +13,7 @@ REPO = os.environ["GITHUB_REPOSITORY"]
 TOKEN = os.environ["GITHUB_TOKEN"]
 SIGNOFF_LABEL = "release-sign-off"
 OVERRIDE_LABEL = "freeze-override"
+FROZEN_LABEL = "release-frozen"
 CHECK_WORKFLOW = "Release freeze check"
 SOURCE_BRANCH = "dev"
 TARGET_BRANCH = "master"
@@ -431,6 +432,22 @@ def fail(message):
     sys.exit(1)
 
 
+def mark_pr(number, labels, reason):
+    """Labels a blocked PR and says what to do, once."""
+    if FROZEN_LABEL in labels:
+        return
+    try:
+        api("POST", f"issues/{number}/labels", {"labels": [FROZEN_LABEL]})
+        comment(
+            number,
+            f"🔒 {reason}, so this PR can't be merged. If it must go in, someone who didn't "
+            f"write or approve it needs to add the `{OVERRIDE_LABEL}` label. "
+            "A new RC and sign-off are needed after it's merged.",
+        )
+    except urllib.error.HTTPError:
+        print("Couldn't label the PR.")
+
+
 def check(event):
     number = event["pull_request"]["number"]
     pull = api("GET", f"pulls/{number}")
@@ -445,6 +462,7 @@ def check(event):
         return
 
     labels = [label["name"] for label in pull["labels"]]
+    mark_pr(number, labels, reason)
     if OVERRIDE_LABEL not in labels:
         fail(f"{reason}. A late fix needs the `{OVERRIDE_LABEL}` label from a second person.")
 
