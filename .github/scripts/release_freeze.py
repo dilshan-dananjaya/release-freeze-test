@@ -233,11 +233,17 @@ def create_release_pr(number, version, body):
         comment(number, f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.")
         return
     reviewers = people(body, REVIEWER_LINE)
+    requested = []
     try:
         if reviewers:
-            api("POST", f"pulls/{pull['number']}/requested_reviewers", {"reviewers": reviewers})
-        comment(number, f"Created release PR #{pull['number']}.")
+            result = api("POST", f"pulls/{pull['number']}/requested_reviewers", {"reviewers": reviewers})
+            requested = [person["login"].lower() for person in (result or {}).get("requested_reviewers", [])]
     except urllib.error.HTTPError:
+        pass
+    # GitHub skips a name it can't add without returning an error.
+    if set(reviewers) <= set(requested):
+        comment(number, f"Created release PR #{pull['number']}.")
+    else:
         comment(number, f"Created release PR #{pull['number']}, but couldn't request a review from the `{REVIEWER_LINE}`.")
 
 
