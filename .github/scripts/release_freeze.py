@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Freeze a release branch after sign-off. See jahanVerse#18469."""
+
 import json
 import os
 import re
@@ -73,7 +74,10 @@ def branch_sha(branch):
 
 def blob_sha(path, ref):
     """Returns the file's blob sha on a branch, or None if it isn't there."""
-    found = api("GET", f"contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref, safe='')}")
+    found = api(
+        "GET",
+        f"contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref, safe='')}",
+    )
     if isinstance(found, list):
         return "folder"
     return found["sha"] if found else None
@@ -85,7 +89,10 @@ def dev_missing(branch):
     A merge commit that changes no files doesn't count, so a release merge into
     master that dev already has needs no sync.
     """
-    found = api("GET", f"compare/{SOURCE_BRANCH}...{urllib.parse.quote(branch, safe='/')}?per_page=1")
+    found = api(
+        "GET",
+        f"compare/{SOURCE_BRANCH}...{urllib.parse.quote(branch, safe='/')}?per_page=1",
+    )
     if not found:
         return False
     if found["ahead_by"] == 0:
@@ -107,13 +114,23 @@ def sync_prs(branches):
     owner = REPO.split("/")[0]
     found = []
     for branch in branches:
-        query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{sync_branch(branch)}", "base": SOURCE_BRANCH})
+        query = urllib.parse.urlencode(
+            {
+                "state": "open",
+                "head": f"{owner}:{sync_branch(branch)}",
+                "base": SOURCE_BRANCH,
+            }
+        )
         found += api("GET", f"pulls?{query}") or []
     return found
 
 
 def sync_branch(branch):
-    return "sync/master-into-dev" if branch == TARGET_BRANCH else f"sync/{branch.replace('/', '-')}-into-dev"
+    return (
+        "sync/master-into-dev"
+        if branch == TARGET_BRANCH
+        else f"sync/{branch.replace('/', '-')}-into-dev"
+    )
 
 
 def dev_status(version):
@@ -124,7 +141,9 @@ def dev_status(version):
         return "Dev in sync ✅"
     links = " ".join(f"#{pull['number']}" for pull in sync_prs(missing))
     names = ", ".join(f"`{branch}`" for branch in missing)
-    return f"⚠️ dev is missing changes from {names}" + (f": merge {links}" if links else "")
+    return f"⚠️ dev is missing changes from {names}" + (
+        f": merge {links}" if links else ""
+    )
 
 
 def latest_rc(version):
@@ -138,7 +157,9 @@ def latest_rc(version):
 
 
 def read_version(body):
-    match = re.search(r"^jahanVerse version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M)
+    match = re.search(
+        r"^jahanVerse version:[ \t]*`?(v\d+\.\d+\.\d+)`?[ \t\r]*$", body, re.M
+    )
     return match.group(1) if match and match.group(1) != BLANK_VERSION else None
 
 
@@ -151,7 +172,9 @@ def client_release(body):
     """Returns the client and its version, or None until both are filled in."""
     client = read_text(body, "Client")
     version = read_text(body, "Client version")
-    return f"{client} {version}" if client and version not in ("", BLANK_VERSION) else None
+    return (
+        f"{client} {version}" if client and version not in ("", BLANK_VERSION) else None
+    )
 
 
 def ticket_title(body):
@@ -172,7 +195,11 @@ def read_jira(body):
 def people(body, line):
     """Returns the lower-case GitHub names on a ticket line, like `QA Approver: @a @b`."""
     match = re.search(rf"^{line}:(.*)$", body, re.M)
-    return [name.lower() for name in re.findall(r"@([A-Za-z0-9-]+)", match.group(1))] if match else []
+    return (
+        [name.lower() for name in re.findall(r"@([A-Za-z0-9-]+)", match.group(1))]
+        if match
+        else []
+    )
 
 
 def tick_problem(body, box, sender):
@@ -183,7 +210,9 @@ def tick_problem(body, box, sender):
     names = people(body, line)
     if not names:
         return f"Add a name to `{line}:` first."
-    if box in SIGNOFF_BOXES and set(people(body, OWNER_LINE)) & set(people(body, QA_LINE)):
+    if box in SIGNOFF_BOXES and set(people(body, OWNER_LINE)) & set(
+        people(body, QA_LINE)
+    ):
         return f"`{OWNER_LINE}` and `{QA_LINE}` must be different people."
     if sender.lower() not in names:
         return f"@{sender} isn't the {line}."
@@ -193,7 +222,11 @@ def tick_problem(body, box, sender):
 def assign_people(number, issue, body):
     """Assigns the named people to the ticket. Names GitHub can't assign are skipped."""
     current = {person["login"].lower() for person in issue["assignees"]}
-    missing = [name for name in people(body, OWNER_LINE) + people(body, QA_LINE) if name not in current]
+    missing = [
+        name
+        for name in people(body, OWNER_LINE) + people(body, QA_LINE)
+        if name not in current
+    ]
     if not missing:
         return
     try:
@@ -263,9 +296,43 @@ def set_line(body, name, value):
     return re.sub(rf"^{name}:.*$", f"{name}: {value}", body, flags=re.M)
 
 
+def reapply(start, changed, fresh):
+    """Puts the bot's line changes (start -> changed) onto the ticket as it is now.
+
+    Someone may save the ticket while the bot runs. Their lines are kept: a bot
+    change is only applied where the line is still what the bot started from.
+    The bot only edits lines in place, so lines pair up one to one.
+    """
+    if fresh == start:
+        return changed
+    before, after, now = start.split("\n"), changed.split("\n"), fresh.split("\n")
+    if len(before) != len(after):
+        return changed
+    for old, new in zip(before, after):
+        if old != new and old in now:
+            now[now.index(old)] = new
+    return "\n".join(now)
+
+
+def save(number, start, changed):
+    """Saves the bot's changes to a ticket without losing edits made meanwhile.
+
+    Returns the ticket as saved, to use as `start` for the next save.
+    """
+    if changed == start:
+        return start
+    fresh = api("GET", f"issues/{number}")["body"] or ""
+    merged = reapply(start, changed, fresh)
+    if merged != fresh:
+        api("PATCH", f"issues/{number}", {"body": merged})
+    return merged
+
+
 def frozen_by(number, body, rc):
     client = read_text(body, "Client") or f"#{number}"
-    return f"🔒 Frozen by [{client}](https://github.com/{REPO}/issues/{number}) on `{rc}`"
+    return (
+        f"🔒 Frozen by [{client}](https://github.com/{REPO}/issues/{number}) on `{rc}`"
+    )
 
 
 def show_frozen(body, version, rc):
@@ -298,7 +365,9 @@ def fill_ticket(body):
         if branch_sha(branch):
             mark += f" · {dev_status(version)}"
     body = set_mark(body, BRANCH_BOX, mark)
-    body = set_line(body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC")
+    body = set_line(
+        body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC"
+    )
     rc_changed = old_rc != rc and any(boxes(body).values())
     if rc_changed:
         body = clear_boxes(body)
@@ -321,8 +390,25 @@ def rerun_checks(branch):
         sha = pull["head"]["sha"]
         runs = api("GET", f"actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]
         runs = [run for run in runs if run["name"] == CHECK_WORKFLOW]
-        if runs:
+        if not runs:
+            continue
+        try:
             api("POST", f"actions/runs/{runs[0]['id']}/rerun", {})
+        except urllib.error.HTTPError:
+            # Still running, or too old to re-run. Its next push or review runs it again.
+            print(f"Couldn't re-run the freeze check on PR #{pull['number']}.")
+
+
+def rc_problem(branch, rc, head, rc_commit):
+    """Returns why this RC can't be frozen, or None if it's the tip of the branch."""
+    if not head or not rc_commit:
+        return f"`{branch}` or its RC doesn't exist yet."
+    if head == rc_commit:
+        return None
+    found = api("GET", f"compare/{rc_commit}...{head}?per_page=1")
+    if found and found["status"] == "ahead":
+        return f"`{branch}` has moved past `{rc}`. Create a new RC, test it and sign off again."
+    return f"`{rc}` isn't on `{branch}`. Cut RCs from `{branch}` only, then sign off again."
 
 
 def freeze(number, body):
@@ -331,32 +417,44 @@ def freeze(number, body):
     branch = f"release/{version}"
     head = branch_sha(branch)
     rc_commit = tag_sha(rc) if rc else None
-    if not head or not rc_commit:
-        comment(number, f"Not frozen: `{branch}` or its RC doesn't exist yet.")
-        return
-    if head != rc_commit:
-        comment(
-            number,
-            f"Not frozen: `{branch}` has moved past `{rc}`. "
-            "Create a new RC, test it and sign off again.",
-        )
+    problem = rc_problem(branch, rc, head, rc_commit)
+    if problem:
+        comment(number, f"Not frozen: {problem}")
         return
     frozen = f"frozen/{version}"
-    if tag_sha(frozen):
+    found = tag_sha(frozen)
+    if found == head:
+        # Two sign-off runs can finish together; the first one already froze it.
+        return
+    if found:
         api("PATCH", f"git/refs/tags/{frozen}", {"sha": head, "force": True})
     else:
         api("POST", "git/refs", {"ref": f"refs/tags/{frozen}", "sha": head})
-    rerun_checks(branch)
     for issue in version_tickets(version):
-        status = f"🔒 Frozen on `{rc}`" if issue["number"] == number else frozen_by(number, body, rc)
-        api("PATCH", f"issues/{issue['number']}", {"body": set_status(issue["body"] or "", status)})
-        comment(issue["number"], f"Frozen on `{rc}`. PRs into `{branch}` are now blocked.")
+        status = (
+            f"🔒 Frozen on `{rc}`"
+            if issue["number"] == number
+            else frozen_by(number, body, rc)
+        )
+        start = issue["body"] or ""
+        save(issue["number"], start, set_status(start, status))
+        comment(
+            issue["number"], f"Frozen on `{rc}`. PRs into `{branch}` are now blocked."
+        )
+    # Last, so a check that can't be re-run doesn't stop the tickets showing the freeze.
+    rerun_checks(branch)
 
 
 def version_tickets(version):
     """Returns the open tickets for this jahanVerse version."""
-    query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
-    return [issue for issue in api("GET", f"issues?{query}") if read_version(issue["body"] or "") == version]
+    query = urllib.parse.urlencode(
+        {"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100}
+    )
+    return [
+        issue
+        for issue in api("GET", f"issues?{query}")
+        if read_version(issue["body"] or "") == version
+    ]
 
 
 def signed_off(body):
@@ -385,7 +483,9 @@ def release_title(version, jira):
 
 def find_release_pr(version):
     owner = REPO.split("/")[0]
-    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:release/{version}", "base": TARGET_BRANCH})
+    query = urllib.parse.urlencode(
+        {"state": "open", "head": f"{owner}:release/{version}", "base": TARGET_BRANCH}
+    )
     found = api("GET", f"pulls?{query}")
     return found[0] if found else None
 
@@ -393,11 +493,19 @@ def find_release_pr(version):
 def update_pr_title(old_body, body):
     """Keeps the release PR title in step with the ticket's Jira number."""
     version = read_version(body)
-    if not version or version != read_version(old_body) or read_jira(old_body) == read_jira(body):
+    if (
+        not version
+        or version != read_version(old_body)
+        or read_jira(old_body) == read_jira(body)
+    ):
         return
     pull = find_release_pr(version)
     if pull:
-        api("PATCH", f"pulls/{pull['number']}", {"title": release_title(version, read_jira(body))})
+        api(
+            "PATCH",
+            f"pulls/{pull['number']}",
+            {"title": release_title(version, read_jira(body))},
+        )
 
 
 def create_release_pr(number, version, body):
@@ -408,58 +516,87 @@ def create_release_pr(number, version, body):
         comment(number, f"Release PR #{found['number']} already exists.")
         return found
     try:
-        pull = api("POST", "pulls", {
-            "title": release_title(version, read_jira(body)),
-            "head": branch,
-            "base": TARGET_BRANCH,
-            "body": f"Release {version}, cut from `{SOURCE_BRANCH}`.\n\nChecklist: #{number}",
-        })
+        pull = api(
+            "POST",
+            "pulls",
+            {
+                "title": release_title(version, read_jira(body)),
+                "head": branch,
+                "base": TARGET_BRANCH,
+                "body": f"Release {version}, cut from `{SOURCE_BRANCH}`.\n\nChecklist: #{number}",
+            },
+        )
     except urllib.error.HTTPError as error:
-        comment(number, f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.")
+        comment(
+            number,
+            f"Couldn't create the release PR ({error.code}). Untick and tick `{BRANCH_BOX}` to try again.",
+        )
         return None
     reviewers = [PR_REVIEWER] if PR_REVIEWER else []
     requested = []
     try:
         if reviewers:
-            result = api("POST", f"pulls/{pull['number']}/requested_reviewers", {"reviewers": reviewers})
-            requested = [person["login"].lower() for person in (result or {}).get("requested_reviewers", [])]
+            result = api(
+                "POST",
+                f"pulls/{pull['number']}/requested_reviewers",
+                {"reviewers": reviewers},
+            )
+            requested = [
+                person["login"].lower()
+                for person in (result or {}).get("requested_reviewers", [])
+            ]
     except urllib.error.HTTPError:
         pass
     # GitHub skips a name it can't add without returning an error.
     if set(reviewers) <= set(requested):
         comment(number, f"Created release PR #{pull['number']}.")
     else:
-        comment(number, f"Created release PR #{pull['number']}, but couldn't request a review from `{PR_REVIEWER}`.")
+        comment(
+            number,
+            f"Created release PR #{pull['number']}, but couldn't request a review from `{PR_REVIEWER}`.",
+        )
     return pull
 
 
-def branch_box(number, before, after, body, sender):
-    """Creates the release branch when its box is newly ticked."""
+def branch_box(number, before, after, body, saved, sender):
+    """Creates the release branch when its box is newly ticked. Returns the body and the saved body."""
     if box_ticked(before, BRANCH_BOX) or not box_ticked(after, BRANCH_BOX):
-        return body
+        return body, saved
     version = read_version(body)
-    reason = tick_problem(body, BRANCH_BOX, sender)
+    reason = tick_problem(before, BRANCH_BOX, sender)
     if not reason and not version:
         reason = "Add `jahanVerse version: vX.Y.Z` first."
-    if not reason and not branch_sha(f"release/{version}") and dev_missing(TARGET_BRANCH):
+    if (
+        not reason
+        and not branch_sha(f"release/{version}")
+        and dev_missing(TARGET_BRANCH)
+    ):
         links = " ".join(f"#{pull['number']}" for pull in sync_prs([TARGET_BRANCH]))
-        step = f"Merge {links}" if links else "Run `Sync master into dev` and merge its PR"
+        step = (
+            f"Merge {links}" if links else "Run `Sync master into dev` and merge its PR"
+        )
         reason = (
             f"`{SOURCE_BRANCH}` is missing changes from `{TARGET_BRANCH}`. "
             f"{step} with a merge commit, then tick again."
         )
     if not reason:
-        api("PATCH", f"issues/{number}", {"body": set_mark(body, BRANCH_BOX, "⏳")})
+        saved = body = save(number, saved, set_mark(body, BRANCH_BOX, "⏳"))
         create_branch(number, version)
         pull = create_release_pr(number, version, body)
-        return set_mark(body, MERGE_BOX, f"[PR #{pull['number']}]({pull['html_url']})") if pull else body
+        if pull:
+            body = set_mark(
+                body, MERGE_BOX, f"[PR #{pull['number']}]({pull['html_url']})"
+            )
+        return body, saved
     comment(number, f"`{BRANCH_BOX}` was changed back: {reason}")
-    return set_box(body, BRANCH_BOX, False)
+    return set_box(body, BRANCH_BOX, False), saved
 
 
 def reset_version(number, old_body, body):
     """A new version needs its own branch, PR and Jira number."""
-    if not box_ticked(old_body, BRANCH_BOX) or read_version(old_body) == read_version(body):
+    if not box_ticked(old_body, BRANCH_BOX) or read_version(old_body) == read_version(
+        body
+    ):
         return body
     body = clear_boxes(set_box(set_box(body, BRANCH_BOX, False), MERGE_BOX, False))
     body = set_mark(set_mark(body, BRANCH_BOX, ""), MERGE_BOX, "")
@@ -475,9 +612,16 @@ def adhoc_box(number, before, after, body):
         return body
     release = client_release(body)
     if not release:
-        comment(number, f"`{ADHOC_BOX}` was changed back: Add `Client:` and `Client version:` first.")
+        comment(
+            number,
+            f"`{ADHOC_BOX}` was changed back: Add `Client:` and `Client version:` first.",
+        )
         return set_box(body, ADHOC_BOX, False)
-    ticket = api("POST", "issues", {"title": f"{ADHOC_BOX} for {release}", "body": f"{ADHOC_BOX} for #{number}."})
+    ticket = api(
+        "POST",
+        "issues",
+        {"title": f"{ADHOC_BOX} for {release}", "body": f"{ADHOC_BOX} for #{number}."},
+    )
     return re.sub(
         rf"^(- \[[ xX]\] ){ADHOC_BOX}",
         lambda match: f"{match.group(1)}[{ADHOC_BOX}]({ticket['html_url']})",
@@ -490,20 +634,23 @@ def signoff(event):
     issue = event["issue"]
     number = issue["number"]
     sender = event["sender"]["login"]
-    live = api("GET", f"issues/{number}")["body"] or ""
+    saved = api("GET", f"issues/{number}")["body"] or ""
 
     changed = []
+    old_body = ""
     if event["action"] == "edited":
         if "body" not in event.get("changes", {}):
             return
-        before = boxes(event["changes"]["body"]["from"] or "")
+        old_body = event["changes"]["body"]["from"] or ""
+        before = boxes(old_body)
         after = boxes(issue["body"] or "")
         changed = [box for box in after if before.get(box) != after[box]]
 
-    body = live
+    body = saved
     allowed = []
     for box in changed:
-        problem = tick_problem(body, box, sender)
+        # Names come from before the edit, so one edit can't add a name and tick its box.
+        problem = tick_problem(old_body, box, sender)
         if problem:
             body = set_box(body, box, before.get(box, False))
             comment(number, f"`{box}` was changed back: {problem}")
@@ -511,25 +658,24 @@ def signoff(event):
             allowed.append(box)
 
     if event["action"] == "edited":
-        old_body = event["changes"]["body"]["from"] or ""
         body = reset_version(number, old_body, body)
-        body = branch_box(number, old_body, issue["body"] or "", body, sender)
+        body, saved = branch_box(
+            number, old_body, issue["body"] or "", body, saved, sender
+        )
         body = adhoc_box(number, old_body, issue["body"] or "", body)
         update_pr_title(old_body, body)
 
     body, rc_changed = fill_ticket(body)
-    # Read again: the waiting mark may have changed the ticket since the start.
-    update = {}
-    if body != (api("GET", f"issues/{number}")["body"] or ""):
-        update["body"] = body
+    body = save(number, saved, body)
     title = ticket_title(body)
     if title and title != issue["title"]:
-        update["title"] = title
-    if update:
-        api("PATCH", f"issues/{number}", update)
+        api("PATCH", f"issues/{number}", {"title": title})
     assign_people(number, issue, body)
     if rc_changed:
-        comment(number, f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.")
+        comment(
+            number,
+            f"The RC is now `{read_rc(body)}`, so the sign-off ticks were cleared.",
+        )
         return
 
     if allowed and signed_off(body) and not already_frozen(body):
@@ -545,14 +691,15 @@ def new_rc(event):
 
 def refresh(version=None):
     """Updates the open tickets, for one version or all of them."""
-    query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
+    query = urllib.parse.urlencode(
+        {"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100}
+    )
     for issue in api("GET", f"issues?{query}"):
         body = issue["body"] or ""
         if not read_version(body) or version not in (None, read_version(body)):
             continue
         new_body, rc_changed = fill_ticket(body)
-        if new_body != body:
-            api("PATCH", f"issues/{issue['number']}", {"body": new_body})
+        new_body = save(issue["number"], body, new_body)
         if rc_changed:
             comment(
                 issue["number"],
@@ -576,12 +723,25 @@ def open_sync_pr(branch):
     if found:
         number = found[0]["number"]
         try:
-            api("POST", "merges", {"base": sync, "head": branch, "commit_message": f"Merge {branch} into {sync}"})
+            api(
+                "POST",
+                "merges",
+                {
+                    "base": sync,
+                    "head": branch,
+                    "commit_message": f"Merge {branch} into {sync}",
+                },
+            )
         except urllib.error.HTTPError as error:
             if error.code != 409:
                 raise
-            comment(number, f"`{branch}` no longer merges cleanly into `{sync}`. Merge it by hand and fix the conflicts.")
-            return f"#{number} needs the latest `{branch}` merged in by hand (conflicts)."
+            comment(
+                number,
+                f"`{branch}` no longer merges cleanly into `{sync}`. Merge it by hand and fix the conflicts.",
+            )
+            return (
+                f"#{number} needs the latest `{branch}` merged in by hand (conflicts)."
+            )
         return f"Added to #{number}, which brings `{branch}` into `{SOURCE_BRANCH}`."
     head = branch_sha(branch)
     # No open PR, so a leftover sync branch is from a merged or closed one.
@@ -590,12 +750,16 @@ def open_sync_pr(branch):
     else:
         api("POST", "git/refs", {"ref": f"refs/heads/{sync}", "sha": head})
     try:
-        pull = api("POST", "pulls", {
-            "title": f"Merge {branch} into {SOURCE_BRANCH}",
-            "head": sync,
-            "base": SOURCE_BRANCH,
-            "body": SYNC_PR_BODY.format(branch=branch, sync=sync),
-        })
+        pull = api(
+            "POST",
+            "pulls",
+            {
+                "title": f"Merge {branch} into {SOURCE_BRANCH}",
+                "head": sync,
+                "base": SOURCE_BRANCH,
+                "body": SYNC_PR_BODY.format(branch=branch, sync=sync),
+            },
+        )
     except urllib.error.HTTPError as error:
         # Another fix merged at the same moment may have opened it first.
         if sync_prs([branch]):
@@ -614,8 +778,12 @@ def release_fix(event):
         return
     version = match.group(1)
     if dev_missing(branch):
-        numbers = [issue["number"] for issue in version_tickets(version)] or [pull["number"]]
-        comment_all(numbers, f"PR #{pull['number']} is in `{branch}`. {open_sync_pr(branch)}")
+        numbers = [issue["number"] for issue in version_tickets(version)] or [
+            pull["number"]
+        ]
+        comment_all(
+            numbers, f"PR #{pull['number']} is in `{branch}`. {open_sync_pr(branch)}"
+        )
     refresh(version)
 
 
@@ -637,7 +805,9 @@ def version_numbers(tag):
 def is_older(version):
     """A merged release PR can also close an older one, which must not become Latest."""
     latest = api("GET", "releases/latest")
-    return bool(latest) and version_numbers(version) < version_numbers(latest["tag_name"])
+    return bool(latest) and version_numbers(version) < version_numbers(
+        latest["tag_name"]
+    )
 
 
 def newest_frozen(version):
@@ -653,26 +823,41 @@ def publish(event):
     if not match:
         return
     version = match.group(1)
-    numbers = [issue["number"] for issue in version_tickets(version)] or [pull["number"]]
+    numbers = [issue["number"] for issue in version_tickets(version)] or [
+        pull["number"]
+    ]
     frozen = tag_sha(f"frozen/{version}")
     if tag_sha(version):
         comment_all(numbers, f"`{version}` already exists, so nothing was published.")
     elif is_older(version):
-        comment_all(numbers, f"`{version}` wasn't published: it's older than the latest release.")
+        comment_all(
+            numbers,
+            f"`{version}` wasn't published: it's older than the latest release.",
+        )
     elif not frozen:
         comment_all(numbers, f"`{version}` wasn't published: it has no sign-off.")
     elif frozen != pull["head"]["sha"]:
-        comment_all(numbers, f"`{version}` wasn't published: the PR has commits that aren't in the approved RC.")
+        comment_all(
+            numbers,
+            f"`{version}` wasn't published: the PR has commits that aren't in the approved RC.",
+        )
     else:
         try:
-            release = api("POST", "releases", {
-                "tag_name": version,
-                "target_commitish": frozen,
-                "name": version,
-                "make_latest": "true" if newest_frozen(version) else "false",
-                "generate_release_notes": True,
-            })
-            comment_all(numbers, f"Published [`{version}`]({release['html_url']}) as the latest release.")
+            release = api(
+                "POST",
+                "releases",
+                {
+                    "tag_name": version,
+                    "target_commitish": frozen,
+                    "name": version,
+                    "make_latest": "true" if newest_frozen(version) else "false",
+                    "generate_release_notes": True,
+                },
+            )
+            comment_all(
+                numbers,
+                f"Published [`{version}`]({release['html_url']}) as the latest release.",
+            )
         except urllib.error.HTTPError as error:
             comment_all(numbers, f"Couldn't publish `{version}` ({error.code}).")
 
@@ -716,7 +901,9 @@ def check(event):
     labels = [label["name"] for label in pull["labels"]]
     mark_pr(number, labels, reason)
     if OVERRIDE_LABEL not in labels:
-        fail(f"{reason}. A late fix needs the `{OVERRIDE_LABEL}` label from a second person.")
+        fail(
+            f"{reason}. A late fix needs the `{OVERRIDE_LABEL}` label from a second person."
+        )
 
     events = api("GET", f"issues/{number}/events?per_page=100")
     added = [
@@ -728,34 +915,45 @@ def check(event):
     reviews = api("GET", f"pulls/{number}/reviews?per_page=100")
     approvers = {r["user"]["login"] for r in reviews if r["state"] == "APPROVED"}
     if labeller == pull["user"]["login"] or labeller in approvers:
-        fail(f"{reason}. `{OVERRIDE_LABEL}` must come from someone who didn't write or approve this PR.")
+        fail(
+            f"{reason}. `{OVERRIDE_LABEL}` must come from someone who didn't write or approve this PR."
+        )
     print(f"{reason}, but {labeller} added {OVERRIDE_LABEL}.")
 
 
-def gate(version):
+def gate(version, tag):
+    """Stops a release whose tag isn't the signed-off RC."""
     frozen = tag_sha(f"frozen/{version}")
     head = branch_sha(f"release/{version}")
     if not frozen:
         fail(f"`{version}` has no sign-off: `frozen/{version}` doesn't exist.")
+    if tag_sha(tag) != frozen:
+        fail(
+            f"`{tag}` isn't the signed-off RC. Promote the RC that `frozen/{version}` is on."
+        )
     if frozen != head:
         fail(f"`release/{version}` has commits that aren't in the approved RC.")
-    print(f"{version} matches the approved RC at {frozen}.")
+    print(f"{tag} is the approved RC at {frozen}.")
 
 
 def main():
     command = sys.argv[1]
     if command == "gate":
-        gate(sys.argv[2])
+        gate(sys.argv[2], sys.argv[3])
         return
     if command == "dev-missing":
         missing = dev_missing(sys.argv[2])
-        print(f"dev {'is missing' if missing else 'has'} the file changes on {sys.argv[2]}.")
+        print(
+            f"dev {'is missing' if missing else 'has'} the file changes on {sys.argv[2]}."
+        )
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"needed={str(missing).lower()}\n")
         return
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
         event = json.load(f)
-    {"signoff": signoff, "new-rc": new_rc, "check": check, "merged": merged}[command](event)
+    {"signoff": signoff, "new-rc": new_rc, "check": check, "merged": merged}[command](
+        event
+    )
 
 
 if __name__ == "__main__":

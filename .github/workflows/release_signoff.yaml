@@ -16,8 +16,11 @@ permissions:
   issues: write
   pull-requests: write
 
+# Ticket edits each get their own run: a shared group keeps only one waiting run,
+# so a third quick edit would cancel the second. The script saves only the lines
+# it changed, so runs side by side don't lose each other's edits.
 concurrency:
-  group: release-signoff-${{ github.event.issue.number || github.event.pull_request.number || github.event.release.tag_name }}
+  group: release-signoff-${{ github.event_name == 'issues' && github.run_id || github.event.pull_request.number || github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
