@@ -90,9 +90,9 @@ def dev_missing(branch):
         return False
     if found["ahead_by"] == 0:
         return False
-    files = found.get("files", [])
-    if not files or len(files) >= MAX_FILES:
-        # No file list means the diff is too big for the API to show.
+    files = found.get("files")
+    if files is None or len(files) >= MAX_FILES:
+        # The diff is too big for the API to list, so assume dev is missing something.
         return True
     wanted = {}
     for item in files:
