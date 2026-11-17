@@ -1,0 +1,137 @@
+name: Sync master into dev
+
+# Anything that lands on master (a release merge or a hotfix) and is not already
+# on dev has to be carried back, otherwise the next release PR conflicts on it.
+# This opens - or refreshes - a PR from `sync/master-into-dev` to dev.
+#
+# dev has no bypass actors and requires a PR, an approval and `CI Status Gate`,
+# so this cannot push to dev itself. It only prepares the PR; a person still
+# reviews it, applies /run-tests (see CI_CONTRACT.md: a bot cannot start the
+# gate), and merges it.
+#
+# MERGE IT WITH A MERGE COMMIT. Rebase-merging rewrites the commits, so the
+# originals on master never become ancestors of dev and the drift comes back.
+# (Squash is already disabled on this repo.)
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+# Queue rather than cancel: two quick pushes to master (release + hotfix) must
+# both end up in the PR, and the second run merges on top of the first's branch.
+concurrency:
+  group: sync-master-into-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  SYNC_BRANCH: sync/master-into-dev
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      # A release merge commit that changes no files doesn't need a sync PR:
+      # dev already got the release fixes from the release -> dev PRs (#18947).
+      - name: Check whether dev is missing file changes from master
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/release_freeze.py dev-missing master | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare the sync branch
+        if: steps.check.outputs.needed == 'true'
+        id: branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          PR=$(gh pr list --head "$SYNC_BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$PR" ] && git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null; then
+            # An open sync PR already exists: build on its branch (never force it,
+            # someone may have pushed a conflict resolution to it).
+            git checkout -B "$SYNC_BRANCH" "origin/$SYNC_BRANCH"
+            if git merge-base --is-ancestor origin/master HEAD; then
+              echo "Open PR #$PR already contains master - nothing to push." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "pushed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # No open PR, so any leftover branch is from a merged/closed one.
+            git push origin --delete "$SYNC_BRANCH" 2>/dev/null || true
+            git checkout -B "$SYNC_BRANCH" origin/dev
+          fi
+
+          if git merge --no-ff origin/master -m "chore: merge master into dev"; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            if [ -n "$PR" ]; then
+              gh pr comment "$PR" --body "master moved again ($(git rev-parse --short origin/master)) and no longer merges cleanly into this branch. Merge \`origin/master\` into \`$SYNC_BRANCH\` by hand and resolve the conflicts."
+              echo "::warning::Could not merge master into the existing sync PR #$PR; commented on it."
+              echo "pushed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Hand the PR over unmerged at master's tip. GitHub will show it as
+            # conflicting, and a person resolves it by merging dev into the branch.
+            git checkout -B "$SYNC_BRANCH" origin/master
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          git push origin "$SYNC_BRANCH"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open the PR, or link it if Actions may not
+        if: steps.branch.outputs.pushed == 'true' && steps.branch.outputs.pr == ''
+        run: |
+          {
+            echo "Carries the commits below from \`master\` back into \`dev\` so hotfixes and release-branch changes don't conflict with the next release."
+            echo ""
+            if [ "${{ steps.branch.outputs.conflicts }}" = "true" ]; then
+              echo "> **Merge conflicts.** \`master\` does not merge cleanly into \`dev\`. Merge \`dev\` into \`$SYNC_BRANCH\` locally, resolve, and push."
+              echo ""
+            fi
+            echo "**Merge this with a merge commit - not rebase.** Rebasing rewrites the commits and the drift returns."
+            echo ""
+            echo "A bot cannot start \`CI Status Gate\`; an allowlisted user needs to apply the \`/run-tests\` label."
+            echo ""
+            echo "Commits on \`master\` that are not on \`dev\`:"
+            echo ""
+            git log --format='- %h %s' origin/dev..origin/master
+          } > /tmp/pr_body.md
+
+          COMPARE="${{ github.server_url }}/${{ github.repository }}/compare/dev...$SYNC_BRANCH?expand=1"
+          if gh pr create --base dev --head "$SYNC_BRANCH" \
+               --title "chore: sync master into dev" \
+               --body-file /tmp/pr_body.md 2>/tmp/pr_err; then
+            echo "Pull request created." >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat /tmp/pr_err
+            {
+              echo "### master has commits dev does not - PR not created automatically"
+              echo ""
+              echo "\`$SYNC_BRANCH\` has been pushed, but this repo does not permit Actions to open pull requests (Settings > Actions > General > Workflow permissions)."
+              echo ""
+              echo "[Open the pull request]($COMPARE)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Unlike the durations job, fail here: a quiet summary link is how a
+            # hotfix goes un-synced. A red run notifies whoever pushed to master.
+            echo "::error::master is ahead of dev and the sync PR could not be opened. Open it from: $COMPARE"
+            exit 1
+          fi

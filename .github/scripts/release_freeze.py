@@ -29,6 +29,8 @@ OWNER_LINE = "Release Owner"
 QA_LINE = "QA Approver"
 PR_REVIEWER = os.environ.get("PR_REVIEWER", "").lower()
 BLANK_VERSION = "v0.0.0"
+# The compare API lists at most this many files.
+MAX_FILES = 300
 TITLE_START = "Release"
 
 
@@ -67,6 +69,62 @@ def tag_sha(tag):
 def branch_sha(branch):
     found = api("GET", f"branches/{urllib.parse.quote(branch, safe='')}")
     return found["commit"]["sha"] if found else None
+
+
+def blob_sha(path, ref):
+    """Returns the file's blob sha on a branch, or None if it isn't there."""
+    found = api("GET", f"contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref, safe='')}")
+    if isinstance(found, list):
+        return "folder"
+    return found["sha"] if found else None
+
+
+def dev_missing(branch):
+    """True if `branch` has file changes that dev doesn't have yet.
+
+    A merge commit that changes no files doesn't count, so a release merge into
+    master that dev already has needs no sync.
+    """
+    found = api("GET", f"compare/{SOURCE_BRANCH}...{urllib.parse.quote(branch, safe='/')}?per_page=1")
+    if not found:
+        return False
+    if found["ahead_by"] == 0:
+        return False
+    files = found.get("files", [])
+    if not files or len(files) >= MAX_FILES:
+        # No file list means the diff is too big for the API to show.
+        return True
+    wanted = {}
+    for item in files:
+        wanted[item["filename"]] = None if item["status"] == "removed" else item["sha"]
+        if item.get("previous_filename"):
+            wanted.setdefault(item["previous_filename"], None)
+    return any(blob_sha(path, SOURCE_BRANCH) != sha for path, sha in wanted.items())
+
+
+def sync_prs(branches):
+    """Returns the open sync PRs into dev for these branches."""
+    owner = REPO.split("/")[0]
+    found = []
+    for branch in branches:
+        query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{sync_branch(branch)}", "base": SOURCE_BRANCH})
+        found += api("GET", f"pulls?{query}") or []
+    return found
+
+
+def sync_branch(branch):
+    return "sync/master-into-dev" if branch == TARGET_BRANCH else f"sync/{branch.replace('/', '-')}-into-dev"
+
+
+def dev_status(version):
+    """Says if dev has everything on master and on the release branch."""
+    branches = [TARGET_BRANCH, f"release/{version}"]
+    missing = [branch for branch in branches if dev_missing(branch)]
+    if not missing:
+        return "Dev in sync ✅"
+    links = " ".join(f"#{pull['number']}" for pull in sync_prs(missing))
+    names = ", ".join(f"`{branch}`" for branch in missing)
+    return f"⚠️ dev is missing changes from {names}" + (f": merge {links}" if links else "")
 
 
 def latest_rc(version):
@@ -234,8 +292,12 @@ def fill_ticket(body):
     rc = latest_rc(version)
     old_rc = read_rc(body)
     branch = f"release/{version}"
-    link = f"[`{branch}`](https://github.com/{REPO}/tree/{branch}) ✅"
-    body = set_mark(body, BRANCH_BOX, link if box_ticked(body, BRANCH_BOX) else "")
+    mark = ""
+    if box_ticked(body, BRANCH_BOX):
+        mark = f"[`{branch}`](https://github.com/{REPO}/tree/{branch}) ✅"
+        if branch_sha(branch):
+            mark += f" · {dev_status(version)}"
+    body = set_mark(body, BRANCH_BOX, mark)
     body = set_line(body, "Release candidate", f"`{rc}`" if rc else "waiting for first RC")
     rc_changed = old_rc != rc and any(boxes(body).values())
     if rc_changed:
@@ -379,6 +441,13 @@ def branch_box(number, before, after, body, sender):
     reason = tick_problem(body, BRANCH_BOX, sender)
     if not reason and not version:
         reason = "Add `jahanVerse version: vX.Y.Z` first."
+    if not reason and not branch_sha(f"release/{version}") and dev_missing(TARGET_BRANCH):
+        links = " ".join(f"#{pull['number']}" for pull in sync_prs([TARGET_BRANCH]))
+        step = f"Merge {links}" if links else "Run `Sync master into dev` and merge its PR"
+        reason = (
+            f"`{SOURCE_BRANCH}` is missing changes from `{TARGET_BRANCH}`. "
+            f"{step} with a merge commit, then tick again."
+        )
     if not reason:
         api("PATCH", f"issues/{number}", {"body": set_mark(body, BRANCH_BOX, "⏳")})
         create_branch(number, version)
@@ -470,12 +539,16 @@ def signoff(event):
 def new_rc(event):
     release = event["release"]
     match = re.fullmatch(r"(v\d+\.\d+\.\d+)-rc\d+", release["tag_name"])
-    if not release["prerelease"] or not match:
-        return
+    if release["prerelease"] and match:
+        refresh(match.group(1))
+
+
+def refresh(version=None):
+    """Updates the open tickets, for one version or all of them."""
     query = urllib.parse.urlencode({"state": "open", "labels": SIGNOFF_LABEL, "per_page": 100})
     for issue in api("GET", f"issues?{query}"):
         body = issue["body"] or ""
-        if read_version(body) != match.group(1):
+        if not read_version(body) or version not in (None, read_version(body)):
             continue
         new_body, rc_changed = fill_ticket(body)
         if new_body != body:
@@ -485,6 +558,76 @@ def new_rc(event):
                 issue["number"],
                 f"The RC is now `{read_rc(new_body)}`, so the sign-off ticks were cleared.",
             )
+
+
+SYNC_PR_BODY = """Brings the fixes merged into `{branch}` back into `dev`, so the sync after the release has nothing to fix (#18947).
+
+**Merge this with a merge commit.** Not rebase or squash, or the same conflict comes back.
+
+PRs opened by Actions don't start the tests. Add the `/run-tests` label first.
+
+If it conflicts, merge `dev` into `{sync}` and fix it there. Never merge `dev` into `{branch}`."""
+
+
+def open_sync_pr(branch):
+    """Opens or updates the PR that brings a release branch into dev. Returns what happened."""
+    sync = sync_branch(branch)
+    found = sync_prs([branch])
+    if found:
+        number = found[0]["number"]
+        try:
+            api("POST", "merges", {"base": sync, "head": branch, "commit_message": f"Merge {branch} into {sync}"})
+        except urllib.error.HTTPError as error:
+            if error.code != 409:
+                raise
+            comment(number, f"`{branch}` no longer merges cleanly into `{sync}`. Merge it by hand and fix the conflicts.")
+            return f"#{number} needs the latest `{branch}` merged in by hand (conflicts)."
+        return f"Added to #{number}, which brings `{branch}` into `{SOURCE_BRANCH}`."
+    head = branch_sha(branch)
+    # No open PR, so a leftover sync branch is from a merged or closed one.
+    if branch_sha(sync):
+        api("PATCH", f"git/refs/heads/{sync}", {"sha": head, "force": True})
+    else:
+        api("POST", "git/refs", {"ref": f"refs/heads/{sync}", "sha": head})
+    try:
+        pull = api("POST", "pulls", {
+            "title": f"Merge {branch} into {SOURCE_BRANCH}",
+            "head": sync,
+            "base": SOURCE_BRANCH,
+            "body": SYNC_PR_BODY.format(branch=branch, sync=sync),
+        })
+    except urllib.error.HTTPError as error:
+        # Another fix merged at the same moment may have opened it first.
+        if sync_prs([branch]):
+            return open_sync_pr(branch)
+        link = f"https://github.com/{REPO}/compare/{SOURCE_BRANCH}...{sync}?expand=1"
+        return f"Couldn't open the PR into `{SOURCE_BRANCH}` ({error.code}). [Open it here]({link}) and merge it with a merge commit."
+    return f"Opened #{pull['number']} to bring `{branch}` into `{SOURCE_BRANCH}`. Add `/run-tests`, then merge it with a merge commit."
+
+
+def release_fix(event):
+    """A fix merged into a release branch reaches dev through one sync PR."""
+    pull = event["pull_request"]
+    branch = pull["base"]["ref"]
+    match = re.fullmatch(r"release/(v\d+\.\d+\.\d+)", branch)
+    if not match:
+        return
+    version = match.group(1)
+    if dev_missing(branch):
+        numbers = [issue["number"] for issue in version_tickets(version)] or [pull["number"]]
+        comment_all(numbers, f"PR #{pull['number']} is in `{branch}`. {open_sync_pr(branch)}")
+    refresh(version)
+
+
+def merged(event):
+    """A PR was merged into master, a release branch, or dev (a sync PR)."""
+    base = event["pull_request"]["base"]["ref"]
+    if base.startswith("release/v"):
+        release_fix(event)
+        return
+    if base == TARGET_BRANCH:
+        publish(event)
+    refresh()
 
 
 def version_numbers(tag):
@@ -604,9 +747,15 @@ def main():
     if command == "gate":
         gate(sys.argv[2])
         return
+    if command == "dev-missing":
+        missing = dev_missing(sys.argv[2])
+        print(f"dev {'is missing' if missing else 'has'} the file changes on {sys.argv[2]}.")
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"needed={str(missing).lower()}\n")
+        return
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
         event = json.load(f)
-    {"signoff": signoff, "new-rc": new_rc, "check": check, "publish": publish}[command](event)
+    {"signoff": signoff, "new-rc": new_rc, "check": check, "merged": merged}[command](event)
 
 
 if __name__ == "__main__":
