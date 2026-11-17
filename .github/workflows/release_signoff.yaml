@@ -5,8 +5,9 @@ on:
     types: [opened, edited]
   release:
     types: [published]
+  # Release PRs into master, fixes into release branches, and sync PRs into dev.
   pull_request_target:
-    branches: [master]
+    branches: [master, dev, 'release/v*']
     types: [closed]
 
 permissions:
@@ -24,13 +25,16 @@ jobs:
     if: >-
       github.event_name == 'release' ||
       contains(github.event.issue.labels.*.name, 'release-sign-off') ||
-      (github.event.pull_request.merged && startsWith(github.event.pull_request.head.ref, 'release/v'))
+      (github.event.pull_request.merged && (
+        github.event.pull_request.base.ref == 'master' ||
+        startsWith(github.event.pull_request.base.ref, 'release/v') ||
+        startsWith(github.event.pull_request.head.ref, 'sync/')))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
-      - run: python3 .github/scripts/release_freeze.py ${{ github.event_name == 'release' && 'new-rc' || github.event_name == 'pull_request_target' && 'publish' || 'signoff' }}
+      - run: python3 .github/scripts/release_freeze.py ${{ github.event_name == 'release' && 'new-rc' || github.event_name == 'pull_request_target' && 'merged' || 'signoff' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_REVIEWER: ${{ vars.RELEASE_PR_REVIEWER }}
